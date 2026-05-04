@@ -2257,7 +2257,7 @@ def create_monthly_returns_comparison_table(fund_returns_dict, cdi_returns, last
         return None, None
     current_month_end = max_date + pd.offsets.MonthEnd(0)
     start_date = (current_month_end - pd.DateOffset(months=last_n_months-1)).replace(day=1)
-    months = pd.date_range(start=start_date, end=current_month_end, freq='M')
+    months = pd.date_range(start=start_date, end=current_month_end, freq='ME')
     cdi_monthly_returns = {}
     for month_end in months:
         month_start = month_end.replace(day=1)
@@ -6210,7 +6210,7 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                             if max_date is not None:
                                 current_month_end = max_date + pd.offsets.MonthEnd(0)
                                 start_date = (current_month_end - pd.DateOffset(months=11)).replace(day=1)
-                                months = pd.date_range(start=start_date, end=current_month_end, freq='M')
+                                months = pd.date_range(start=start_date, end=current_month_end, freq='ME')
                                 month_labels = [m.strftime('%b-%y') for m in months]
                                 
                                 # Benchmark monthly returns
@@ -6487,7 +6487,7 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                     if max_date is not None:
                         current_month_end = max_date + pd.offsets.MonthEnd(0)
                         start_date = (current_month_end - pd.DateOffset(months=11)).replace(day=1)
-                        months = pd.date_range(start=start_date, end=current_month_end, freq='M')
+                        months = pd.date_range(start=start_date, end=current_month_end, freq='ME')
                         month_labels = [m.strftime('%b-%y') for m in months]
                         
                         # ═══════════════════════════════════════════════════════════════════
@@ -11601,7 +11601,7 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
                         if max_date is not None:
                             current_month_end = max_date + pd.offsets.MonthEnd(0)
                             start_date = (current_month_end - pd.DateOffset(months=11)).replace(day=1)
-                            months = pd.date_range(start=start_date, end=current_month_end, freq='M')
+                            months = pd.date_range(start=start_date, end=current_month_end, freq='ME')
                             month_labels = [m.strftime('%b-%y') for m in months]
                             
                             # ═══════════════════════════════════════════════════════════════════
