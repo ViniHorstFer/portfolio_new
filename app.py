@@ -224,6 +224,79 @@ def delete_portfolio_from_supabase(portfolio_name: str, user_id: str = "default"
         st.error(f"Failed to delete portfolio: {e}")
         return False
 
+def save_etf_portfolio_to_supabase(portfolio_name: str, portfolio: dict, user_id: str = "default") -> bool:
+    """Save ETF portfolio to Supabase etf_recommended_portfolios table."""
+    client = get_supabase_client()
+    if not client:
+        return False
+    try:
+        data = {
+            "user_id": user_id,
+            "portfolio_name": portfolio_name,
+            "portfolio_data": json.dumps(portfolio),
+            "updated_at": datetime.now().isoformat()
+        }
+        client.table("etf_recommended_portfolios").upsert(
+            data,
+            on_conflict="user_id,portfolio_name"
+        ).execute()
+        return True
+    except Exception as e:
+        st.error(f"Failed to save ETF portfolio: {e}")
+        return False
+
+
+def load_etf_portfolio_from_supabase(portfolio_name: str, user_id: str = "default") -> dict:
+    """Load ETF portfolio from Supabase - searches across all users."""
+    client = get_supabase_client()
+    if not client:
+        return None
+    try:
+        result = client.table("etf_recommended_portfolios").select("*").eq(
+            "portfolio_name", portfolio_name
+        ).execute()
+        if result.data and len(result.data) > 0:
+            data = result.data[0]["portfolio_data"]
+            return data if isinstance(data, dict) else json.loads(data)
+        return None
+    except Exception as e:
+        st.error(f"Failed to load ETF portfolio: {e}")
+        return None
+
+
+def list_etf_portfolios_from_supabase(user_id: str = "default") -> list:
+    """List all saved ETF portfolios from Supabase - shared across all users."""
+    client = get_supabase_client()
+    if not client:
+        return []
+    try:
+        result = client.table("etf_recommended_portfolios").select(
+            "portfolio_name, user_id, updated_at"
+        ).order(
+            "updated_at", desc=True
+        ).execute()
+        return result.data if result.data else []
+    except Exception as e:
+        st.error(f"Failed to list ETF portfolios: {e}")
+        return []
+
+
+def delete_etf_portfolio_from_supabase(portfolio_name: str, user_id: str = "default") -> bool:
+    """Delete ETF portfolio from Supabase etf_recommended_portfolios table."""
+    client = get_supabase_client()
+    if not client:
+        return False
+    try:
+        client.table("etf_recommended_portfolios").delete().eq(
+            "user_id", user_id
+        ).eq(
+            "portfolio_name", portfolio_name
+        ).execute()
+        return True
+    except Exception as e:
+        st.error(f"Failed to delete ETF portfolio: {e}")
+        return False
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SUPABASE - RISK MONITOR FUNCTIONS
@@ -2257,7 +2330,7 @@ def create_monthly_returns_comparison_table(fund_returns_dict, cdi_returns, last
         return None, None
     current_month_end = max_date + pd.offsets.MonthEnd(0)
     start_date = (current_month_end - pd.DateOffset(months=last_n_months-1)).replace(day=1)
-    months = pd.date_range(start=start_date, end=current_month_end, freq='ME')
+    months = pd.date_range(start=start_date, end=current_month_end, freq='M')
     cdi_monthly_returns = {}
     for month_end in months:
         month_start = month_end.replace(day=1)
@@ -5341,65 +5414,61 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                     
                     current_user = st.session_state.get('username', 'default')
                     user_can_manage = can_user_manage_portfolios(current_user)
-                    
+
                     save_col, load_col = st.columns(2)
-                    
+
                     with save_col:
                         if user_can_manage:
                             st.markdown("##### 💾 Save Current Portfolio")
-                            if st.session_state.get('recommended_portfolio'):
+                            if st.session_state.get('etf_recommended_portfolio'):
                                 save_name = st.text_input(
-                                    "Portfolio Name:", 
-                                    value=f"Portfolio_{datetime.now().strftime('%Y%m%d')}",
-                                    key="supabase_save_name"
+                                    "Portfolio Name:",
+                                    value=f"ETF_Portfolio_{datetime.now().strftime('%Y%m%d')}",
+                                    key="etf_supabase_save_name"
                                 )
-                                if st.button("☁️ Save to Supabase", key="supabase_save_btn", use_container_width=True):
-                                    if save_portfolio_to_supabase(save_name, st.session_state['recommended_portfolio'], current_user):
+                                if st.button("☁️ Save to Supabase", key="etf_supabase_save_btn", use_container_width=True):
+                                    if save_etf_portfolio_to_supabase(save_name, st.session_state['etf_recommended_portfolio'], current_user):
                                         st.success(f"✅ Portfolio '{save_name}' saved!")
                                         st.rerun()
                             else:
                                 st.info("Create a portfolio first to save it")
                         else:
                             st.info("🔒 Saving portfolios is not available for your account.")
-                    
+
                     with load_col:
                         st.markdown("##### 📂 Load Saved Portfolio")
-                        
-                        saved_portfolios = list_portfolios_from_supabase(current_user)
-                        
+
+                        saved_portfolios = list_etf_portfolios_from_supabase(current_user)
+
                         if saved_portfolios:
                             portfolio_options = [p['portfolio_name'] for p in saved_portfolios]
                             selected_portfolio = st.selectbox(
                                 "Select Portfolio:",
                                 portfolio_options,
-                                key="supabase_load_select"
+                                key="etf_supabase_load_select"
                             )
-                            
+
                             if user_can_manage:
                                 btn_col1, btn_col2 = st.columns(2)
                                 with btn_col1:
-                                    load_btn = st.button("📥 Load", key="supabase_load_btn", use_container_width=True)
+                                    load_btn = st.button("📥 Load", key="etf_supabase_load_btn", use_container_width=True)
                                 with btn_col2:
-                                    if st.button("🗑️ Delete", key="supabase_delete_btn", use_container_width=True):
-                                        if delete_portfolio_from_supabase(selected_portfolio, current_user):
+                                    if st.button("🗑️ Delete", key="etf_supabase_delete_btn", use_container_width=True):
+                                        if delete_etf_portfolio_from_supabase(selected_portfolio, current_user):
                                             st.success(f"✅ Portfolio '{selected_portfolio}' deleted!")
                                             st.rerun()
                             else:
-                                load_btn = st.button("📥 Load", key="supabase_load_btn", use_container_width=True)
-                            
+                                load_btn = st.button("📥 Load", key="etf_supabase_load_btn", use_container_width=True)
+
                             if load_btn:
-                                loaded = load_portfolio_from_supabase(selected_portfolio, current_user)
+                                loaded = load_etf_portfolio_from_supabase(selected_portfolio, current_user)
                                 if loaded:
-                                    st.session_state['recommended_portfolio'] = loaded
-                                    st.session_state['recommended_portfolio_saved'] = True
-                                    st.session_state['temp_portfolio'] = loaded.copy()
-                                    if 'inv_fund_tables_computed' in st.session_state:
-                                        del st.session_state['inv_fund_tables_computed']
-                                    if 'inv_fund_returns_cache' in st.session_state:
-                                        del st.session_state['inv_fund_returns_cache']
+                                    st.session_state['etf_recommended_portfolio'] = loaded
+                                    st.session_state['etf_recommended_portfolio_saved'] = True
+                                    st.session_state['etf_temp_portfolio'] = loaded.copy()
                                     st.success(f"✅ Portfolio '{selected_portfolio}' loaded!")
                                     st.rerun()
-                            
+
                             st.markdown("##### 📋 Saved Portfolios")
                             for p in saved_portfolios:
                                 updated = p.get('updated_at', '')[:10] if p.get('updated_at') else 'N/A'
@@ -6210,7 +6279,7 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                             if max_date is not None:
                                 current_month_end = max_date + pd.offsets.MonthEnd(0)
                                 start_date = (current_month_end - pd.DateOffset(months=11)).replace(day=1)
-                                months = pd.date_range(start=start_date, end=current_month_end, freq='ME')
+                                months = pd.date_range(start=start_date, end=current_month_end, freq='M')
                                 month_labels = [m.strftime('%b-%y') for m in months]
                                 
                                 # Benchmark monthly returns
@@ -6487,7 +6556,7 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                     if max_date is not None:
                         current_month_end = max_date + pd.offsets.MonthEnd(0)
                         start_date = (current_month_end - pd.DateOffset(months=11)).replace(day=1)
-                        months = pd.date_range(start=start_date, end=current_month_end, freq='ME')
+                        months = pd.date_range(start=start_date, end=current_month_end, freq='M')
                         month_labels = [m.strftime('%b-%y') for m in months]
                         
                         # ═══════════════════════════════════════════════════════════════════
@@ -11601,7 +11670,7 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
                         if max_date is not None:
                             current_month_end = max_date + pd.offsets.MonthEnd(0)
                             start_date = (current_month_end - pd.DateOffset(months=11)).replace(day=1)
-                            months = pd.date_range(start=start_date, end=current_month_end, freq='ME')
+                            months = pd.date_range(start=start_date, end=current_month_end, freq='M')
                             month_labels = [m.strftime('%b-%y') for m in months]
                             
                             # ═══════════════════════════════════════════════════════════════════
