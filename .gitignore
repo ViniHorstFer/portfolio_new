@@ -1,0 +1,19 @@
+# Generated data (the GitHub Release is the source of truth, not the repo)
+Sheets/
+
+# Local secrets (Actions uses repo secrets, not this file)
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+pinenv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
