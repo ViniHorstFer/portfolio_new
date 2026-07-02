@@ -1,0 +1,72 @@
+name: Daily data refresh
+
+# Runs the single orchestrator (run_daily.py), which incrementally refreshes
+# benchmarks, fund NAVs and stock/ETF prices, then publishes every file the
+# Streamlit app consumes to the GitHub Release.
+
+on:
+  schedule:
+    # 10:00 UTC = 07:00 America/Sao_Paulo. Captures the prior US close and the
+    # overnight CVM publication. (GitHub cron is UTC and may be delayed under load.)
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+    inputs:
+      full_rebuild:
+        description: "Force a full rebuild of every series"
+        type: boolean
+        default: false
+      only:
+        description: "Optional single stage (benchmarks | funds | assets)"
+        type: string
+        default: ""
+
+# Let the job manage releases in this repo with the built-in token.
+permissions:
+  contents: write
+
+# Never run two refreshes at once.
+concurrency:
+  group: daily-data-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run daily refresh
+        env:
+          # Built-in token can create/edit releases and upload assets in THIS repo.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_REPOSITORY ("owner/repo") is provided automatically by Actions.
+          # Override the release tag here if yours is not "data":
+          GH_RELEASE_TAG: ${{ vars.GH_RELEASE_TAG || 'data' }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.full_rebuild }}" = "true" ]; then ARGS="$ARGS --full"; fi
+          if [ -n "${{ inputs.only }}" ]; then ARGS="$ARGS --only ${{ inputs.only }}"; fi
+          echo "Running: python run_daily.py $ARGS"
+          python run_daily.py $ARGS
+
+      - name: Upload run logs as artifact (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sheets-on-failure
+          path: Sheets/
+          if-no-files-found: ignore
+          retention-days: 7
