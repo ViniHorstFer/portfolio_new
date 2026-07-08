@@ -47,8 +47,11 @@ def baixar_cdi(period):
         # Definindo 'data' como índice
         cdi_df.set_index('data', inplace=True)
 
-        cdi_df['CDI_ACUM'] = 0
-        cdi_df['CDI_ACUM'].iloc[1:] = ((1 + cdi_df['valor'].iloc[1:]).cumprod() - 1) * 100
+        # CDI_ACUM: float column + single-step .loc assignment (pandas>=2.2 raises
+        # on chained int<-float writes; this preserves the original values exactly).
+        cdi_df['CDI_ACUM'] = 0.0
+        _acum = ((1 + cdi_df['valor'].iloc[1:]).cumprod() - 1) * 100
+        cdi_df.loc[_acum.index, 'CDI_ACUM'] = _acum
 
         cdi_df.rename(columns={'valor': 'CDI'}, inplace=True)
 
