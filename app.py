@@ -67,6 +67,14 @@ from github_releases import (
     clear_github_cache
 )
 
+# Unified ETF+fund benchmarks (adds CDI, IBOVESPA, SP500, GOLD, USDBRL, BITCOIN
+# to the ETF system, not just VOO)
+from etf_benchmarks import (
+    build_benchmark_returns,
+    to_benchmark_frame,
+    available_benchmarks,
+)
+
 # Wasserstein DRO Optimizer
 try:
     from wasserstein_dro_optimizer import WassersteinDROOptimizer, WassersteinDROConfig, OptimizationResult
@@ -3140,13 +3148,40 @@ def load_etf_prices(file_path=None, uploaded_file=None, from_github=False):
         st.error(f"Error loading ETF prices: {e}")
         return None
 
-def prepare_etf_benchmark_data(prices_df):
-    """Prepare VOO benchmark for ETF system."""
-    if 'VOO' not in prices_df.columns:
-        st.error("VOO benchmark not found")
-        return None
-    voo = prices_df['VOO'].dropna().pct_change().dropna()
-    return pd.DataFrame({'VOO': voo})
+def _load_etf_fund_benchmarks(etf_data_source=None):
+    """Best-effort load of the fund benchmarks (CDI, IBOVESPA, SP500, GOLD,
+    USDBRL, BITCOIN) so the ETF system can use the same set as the fund system.
+    Returns a DataFrame of daily-return columns, or None."""
+    try:
+        if is_github_configured():
+            df = load_benchmarks_from_github()
+            if df is not None and not df.empty:
+                return df
+    except Exception:
+        pass
+    try:
+        path = get_data_path('benchmarks_data')
+        if path:
+            df = load_benchmarks(file_path=path)
+            if df is not None and not df.empty:
+                return df
+    except Exception:
+        pass
+    return None
+
+
+def prepare_etf_benchmark_data(prices_df, fund_benchmarks_df=None):
+    """Build the unified benchmark frame for the ETF system: ETF-price-derived
+    benchmarks (VOO, SPY, ...) merged with the fund benchmarks (CDI, IBOVESPA,
+    SP500, GOLD, USDBRL, BITCOIN). Returns a (map, DataFrame) tuple.
+
+    The DataFrame keeps a 'VOO' column for backward compatibility; the map holds
+    clean per-benchmark return series for selector-driven consumers."""
+    returns_map = build_benchmark_returns(prices_df, fund_benchmarks_df)
+    if not returns_map:
+        st.error("No benchmarks available (need VOO in the ETF prices, or a benchmarks file)")
+        return None, None
+    return returns_map, to_benchmark_frame(returns_map)
 
 def run_etf_system():
     """Run the complete ETF analysis system."""
@@ -3258,8 +3293,9 @@ def run_etf_system():
             st.info("💡 Upload both assets_metrics.xlsx and assets_prices.pkl files")
         return
     
-    benchmarks = prepare_etf_benchmark_data(prices_df)
-    if benchmarks is None:
+    fund_benchmarks_df = _load_etf_fund_benchmarks(etf_data_source)
+    bench_returns_map, benchmarks = prepare_etf_benchmark_data(prices_df, fund_benchmarks_df)
+    if benchmarks is None or benchmarks.empty:
         return
     
     # Create tabs
@@ -3357,8 +3393,15 @@ def run_etf_system():
                 selected_period = st.selectbox("Select Period:", period_list, index=default_period_idx)
             
             with col2:
-                # VOO is the only benchmark
-                selected_benchmarks = ['VOO']
+                # Benchmark selector — full unified set (VOO, CDI, IBOVESPA, SP500, GOLD, USDBRL, BITCOIN)
+                _da_bench_opts = available_benchmarks(bench_returns_map, exclude=selected_etf_ticker)
+                _da_default = _da_bench_opts.index('VOO') if 'VOO' in _da_bench_opts else 0
+                selected_chart_benchmark = st.selectbox(
+                    "Benchmark:", _da_bench_opts, index=_da_default, key="etf_da_chart_bench"
+                )
+                selected_benchmarks = [selected_chart_benchmark]
+            # Use the selected benchmark's returns for the chart below
+            voo_returns = bench_returns_map[selected_chart_benchmark]
             
             # Filter returns based on period
             if selected_period != 'All':
@@ -3401,7 +3444,7 @@ def run_etf_system():
             fig.add_trace(go.Scatter(
                 x=voo_cum_ds.index,
                 y=(voo_cum_ds - 1) * 100,
-                name='VOO (Benchmark)',
+                name=f'{selected_chart_benchmark} (Benchmark)',
                 line=dict(color='#00CED1', width=2),
                 hovertemplate='%{y:.2f}%<extra></extra>'
             ))
@@ -3437,10 +3480,11 @@ def run_etf_system():
             cal_col1, cal_col2 = st.columns([1, 1])
             
             with cal_col1:
+                _cal_opts = available_benchmarks(bench_returns_map, exclude=selected_etf_ticker)
                 selected_calendar_benchmark = st.selectbox(
                     "Select Benchmark for Comparison:",
-                    options=['VOO'],
-                    index=0,
+                    options=_cal_opts,
+                    index=(_cal_opts.index('VOO') if 'VOO' in _cal_opts else 0),
                     key="etf_calendar_benchmark"
                 )
             
@@ -3453,7 +3497,7 @@ def run_etf_system():
                 )
             
             # Create monthly returns table
-            voo_benchmark = benchmarks['VOO']
+            voo_benchmark = benchmarks[selected_calendar_benchmark]
             monthly_table = create_monthly_returns_table(
                 etf_returns,
                 voo_benchmark,
@@ -3692,7 +3736,7 @@ def run_etf_system():
             ETF_BENCHMARK_LIST = ['VOO', 'SPY', 'QQQ', 'IWM', 'DIA', 'EFA', 'EEM', 'GLD', 'TLT', 'HYG', 'LQD', 'VNQ', 'XLF', 'XLE', 'XLK']
             
             # Filter to only available benchmarks in prices_df
-            available_etf_benchmarks = [b for b in ETF_BENCHMARK_LIST if b in prices_df.columns and b != selected_etf_ticker]
+            available_etf_benchmarks = available_benchmarks(bench_returns_map, exclude={selected_etf_ticker, 'CDI', 'USDBRL'})
             
             if len(available_etf_benchmarks) > 0:
                 default_etf_exposure = ['VOO'] if 'VOO' in available_etf_benchmarks else [available_etf_benchmarks[0]] if available_etf_benchmarks else []
@@ -3709,8 +3753,7 @@ def run_etf_system():
                     
                     for bench in selected_etf_exposure_benches:
                         # Get benchmark returns
-                        bench_prices = prices_df[bench].dropna()
-                        bench_returns = bench_prices.pct_change().dropna()
+                        bench_returns = (bench_returns_map[bench] if bench in bench_returns_map else prices_df[bench].dropna().pct_change().dropna())
                         
                         # Align returns
                         common_idx = etf_returns.index.intersection(bench_returns.index)
@@ -3840,8 +3883,7 @@ def run_etf_system():
                 
                 if selected_ts_benchmark:
                     # Get benchmark returns
-                    bench_prices = prices_df[selected_ts_benchmark].dropna()
-                    bench_returns = bench_prices.pct_change().dropna()
+                    bench_returns = (bench_returns_map[selected_ts_benchmark] if selected_ts_benchmark in bench_returns_map else prices_df[selected_ts_benchmark].dropna().pct_change().dropna())
                     
                     # Align returns
                     common_idx = etf_returns.index.intersection(bench_returns.index)
@@ -5634,7 +5676,7 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                     with col2:
                         # ETF Benchmark list
                         ETF_BENCHMARK_LIST = ['VOO', 'SPY', 'QQQ', 'IWM', 'DIA', 'EFA', 'EEM', 'GLD', 'TLT', 'HYG', 'LQD', 'VNQ']
-                        available_benches = [b for b in ETF_BENCHMARK_LIST if b in prices_df.columns]
+                        available_benches = available_benchmarks(bench_returns_map)
                         default_benches = ['VOO'] if 'VOO' in available_benches else []
                         selected_benchmarks = st.multiselect("Select Benchmarks:", available_benches, default=default_benches, key="etf_rec_port_bench")
                     
@@ -5701,9 +5743,8 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                     with cal_col2:
                         comparison_method = st.selectbox("Comparison Method:", ['Relative Performance', 'Percentage Points', 'Benchmark Performance'], index=0, key="etf_rec_comp_method")
                     
-                    if selected_calendar_benchmark in prices_df.columns:
-                        bench_prices = prices_df[selected_calendar_benchmark].dropna()
-                        bench_returns = bench_prices.pct_change().dropna()
+                    if selected_calendar_benchmark in bench_returns_map:
+                        bench_returns = (bench_returns_map[selected_calendar_benchmark] if selected_calendar_benchmark in bench_returns_map else prices_df[selected_calendar_benchmark].dropna().pct_change().dropna())
                         monthly_table = create_monthly_returns_table(portfolio_returns, bench_returns, comparison_method)
                         styled_html = style_monthly_returns_table(monthly_table, comparison_method)
                         st.markdown(styled_html, unsafe_allow_html=True)
@@ -5862,7 +5903,7 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                     st.markdown("### 🌍 Benchmark Exposures")
                     
                     ETF_BENCHMARK_EXPOSURE_LIST = ['VOO', 'SPY', 'QQQ', 'IWM', 'DIA', 'EFA', 'EEM', 'GLD', 'TLT', 'HYG', 'LQD', 'VNQ', 'XLF', 'XLE', 'XLK']
-                    available_exp_benchmarks = [b for b in ETF_BENCHMARK_EXPOSURE_LIST if b in prices_df.columns]
+                    available_exp_benchmarks = available_benchmarks(bench_returns_map, exclude={'CDI', 'USDBRL'})
                     default_exp_exposure = ['VOO'] if 'VOO' in available_exp_benchmarks else []
                     
                     selected_exposure_benches = st.multiselect(
@@ -5877,8 +5918,7 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                         
                         for bench in selected_exposure_benches:
                             with st.spinner(f'Calculating exposure for {bench}...'):
-                                bench_prices = prices_df[bench].dropna()
-                                bench_returns = bench_prices.pct_change().dropna()
+                                bench_returns = (bench_returns_map[bench] if bench in bench_returns_map else prices_df[bench].dropna().pct_change().dropna())
                                 
                                 # Align returns
                                 common_idx = portfolio_returns.index.intersection(bench_returns.index)
@@ -5989,13 +6029,12 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                     st.markdown("### 📈 Portfolio Exposure Time Series Analysis")
                     st.info("💡 Select a benchmark below to visualize the evolution of portfolio exposure metrics over time")
                     
-                    available_ts_benchmarks = ['None'] + [b for b in ETF_BENCHMARK_EXPOSURE_LIST if b in prices_df.columns]
+                    available_ts_benchmarks = ['None'] + available_benchmarks(bench_returns_map, exclude={'CDI', 'USDBRL'})
                     selected_ts_benchmark = st.selectbox("Select Benchmark for Time Series:", available_ts_benchmarks, index=0, key="etf_rec_ts_bench")
                     
-                    if selected_ts_benchmark != 'None' and selected_ts_benchmark in prices_df.columns:
+                    if selected_ts_benchmark != 'None' and selected_ts_benchmark in bench_returns_map:
                         with st.spinner(f'Calculating exposure time series for {selected_ts_benchmark}...'):
-                            bench_prices = prices_df[selected_ts_benchmark].dropna()
-                            bench_returns = bench_prices.pct_change().dropna()
+                            bench_returns = (bench_returns_map[selected_ts_benchmark] if selected_ts_benchmark in bench_returns_map else prices_df[selected_ts_benchmark].dropna().pct_change().dropna())
                             
                             common_idx = portfolio_returns.index.intersection(bench_returns.index)
                             port_ret_aligned = portfolio_returns.reindex(common_idx)
@@ -6203,7 +6242,7 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                 
                 # Select benchmark for comparison (default VOO)
                 ETF_BENCHMARK_LIST = ['VOO', 'SPY', 'QQQ', 'IWM', 'DIA', 'EFA', 'EEM', 'GLD', 'TLT', 'HYG', 'LQD', 'VNQ']
-                available_benches = [b for b in ETF_BENCHMARK_LIST if b in prices_df.columns]
+                available_benches = available_benchmarks(bench_returns_map)
                 default_bench_idx = available_benches.index('VOO') if 'VOO' in available_benches else 0
                 
                 selected_benchmark = st.selectbox(
@@ -6213,9 +6252,8 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                     key="etf_analysis_benchmark"
                 )
                 
-                if etf_returns_dict and selected_benchmark in prices_df.columns:
-                    bench_prices = prices_df[selected_benchmark].dropna()
-                    bench_returns = bench_prices.pct_change().dropna()
+                if etf_returns_dict and selected_benchmark in bench_returns_map:
+                    bench_returns = (bench_returns_map[selected_benchmark] if selected_benchmark in bench_returns_map else prices_df[selected_benchmark].dropna().pct_change().dropna())
                     
                     # Pre-compute tables once and store in session state
                     cache_key = f"{portfolio_key}_{selected_benchmark}"
@@ -6512,12 +6550,11 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                 
                 # Get benchmark returns (VOO as default)
                 ETF_BENCHMARK_LIST = ['VOO', 'SPY', 'QQQ', 'IWM', 'DIA']
-                available_benches = [b for b in ETF_BENCHMARK_LIST if b in prices_df.columns]
+                available_benches = available_benchmarks(bench_returns_map)
                 default_bench = 'VOO' if 'VOO' in available_benches else available_benches[0] if available_benches else None
                 
                 if etf_returns_dict and default_bench:
-                    bench_prices = prices_df[default_bench].dropna()
-                    bench_returns = bench_prices.pct_change().dropna()
+                    bench_returns = (bench_returns_map[default_bench] if default_bench in bench_returns_map else prices_df[default_bench].dropna().pct_change().dropna())
                     
                     # Normalize allocations
                     total_alloc = sum(portfolio.values())
