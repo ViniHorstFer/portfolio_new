@@ -150,7 +150,7 @@ def calculate_fund_metrics(df, info_df=None, cdi=None):
         # Calculate returns
         quota_series = fund_data['VL_QUOTA'].dropna()
         daily_returns = quota_series.pct_change().dropna()
-        monthly_quota = quota_series.resample('M').last()
+        monthly_quota = quota_series.resample('ME').last()
         monthly_returns = monthly_quota.pct_change().dropna()
         
         # Helper functions
@@ -217,7 +217,7 @@ def calculate_fund_metrics(df, info_df=None, cdi=None):
             result['M_ABOVE_0'] = (months_above_zero / total_months) if total_months > 0 else np.nan
             
             if cdi is not None:
-                cdi_monthly = (1 + cdi).resample('M').prod() - 1
+                cdi_monthly = (1 + cdi).resample('ME').prod() - 1
                 aligned_data = pd.DataFrame({'fund': monthly_returns, 'cdi': cdi_monthly}).dropna()
                 
                 if len(aligned_data) > 0:
@@ -438,7 +438,7 @@ def calculate_stock_metrics(prices: pd.DataFrame) -> pd.DataFrame:
         stock_returns_w = stock_prices_w.pct_change().dropna()
         
         # Monthly returns: resample to month-end, then calculate returns
-        stock_prices_m = stock_prices.resample('M').last().dropna()
+        stock_prices_m = stock_prices.resample('ME').last().dropna()
         stock_returns_m = stock_prices_m.pct_change().dropna()
         
         # Skip if insufficient data
