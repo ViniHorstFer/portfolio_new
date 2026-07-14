@@ -9,6 +9,7 @@ incremental updates possible.
 
 import os
 import io
+import time
 import zipfile
 import requests
 import pandas as pd
@@ -80,6 +81,50 @@ _CVM_HEADERS = {
                    '(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
 }
 
+# --- Connectivity hardening ------------------------------------------------
+# dados.cvm.gov.br sometimes fails with "[Errno 101] Network is unreachable"
+# from cloud/CI runners. The common cause is an IPv6 (AAAA) address the runner
+# cannot route to: the client tries IPv6, hangs, then errors. Forcing IPv4
+# resolution avoids that. Disable with CVM_FORCE_IPV4=0 if ever undesirable.
+if os.environ.get('CVM_FORCE_IPV4', '1') == '1':
+    try:
+        import socket as _socket
+        import urllib3.util.connection as _u3_conn
+        _u3_conn.allowed_gai_family = lambda: _socket.AF_INET
+    except Exception:
+        pass
+
+# (connect, read) timeouts. A short connect timeout means an unreachable host
+# fails in seconds instead of hanging for a full minute-plus.
+_CVM_TIMEOUT = (float(os.environ.get('CVM_CONNECT_TIMEOUT', '10')),
+                float(os.environ.get('CVM_READ_TIMEOUT', '90')))
+_CVM_CONN_RETRIES = int(os.environ.get('CVM_CONN_RETRIES', '1'))
+
+
+class CVMUnreachableError(Exception):
+    """dados.cvm.gov.br could not be reached (routing / geo-block / outage).
+
+    Raised so the funds stage fails fast and cleanly instead of grinding through
+    dozens of month URLs at a full timeout each — and so it never publishes
+    degraded data built from empty downloads."""
+
+
+def _cvm_get(url, log=print):
+    """GET a CVM URL with a short connect timeout and a couple of quick retries.
+    Raises CVMUnreachableError if the host is unreachable, so callers can abort
+    the whole run instead of trying every remaining month."""
+    last = None
+    for attempt in range(_CVM_CONN_RETRIES + 1):
+        try:
+            return requests.get(url, headers=_CVM_HEADERS, timeout=_CVM_TIMEOUT)
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            last = e
+            if attempt < _CVM_CONN_RETRIES:
+                log(f"  ! connect issue (attempt {attempt + 1}), retrying: {str(e)[:100]}")
+                time.sleep(2 * (attempt + 1))
+    raise CVMUnreachableError(f"cannot reach {url}: {last}")
+
 
 def _parse_cvm_csv(raw_bytes, yyyymm, cnpjs):
     """Parse one monthly CVM CSV (bytes) -> filtered DataFrame or None."""
@@ -131,7 +176,7 @@ def fetch_cvm_months(months, cnpjs, log=print):
                 if year not in hist_year_cache:
                     url = f"{CVM_BASE_HIST}inf_diario_fi_{year}.zip"
                     log(f"  CVM HIST {year}: {url}")
-                    r = requests.get(url, headers=_CVM_HEADERS, timeout=120)
+                    r = _cvm_get(url, log)
                     if r.status_code != 200 or len(r.content) < 1000:
                         log(f"  ! HIST {year} unavailable (status {r.status_code})")
                         hist_year_cache[year] = {}
@@ -153,7 +198,7 @@ def fetch_cvm_months(months, cnpjs, log=print):
             else:
                 url = f"{CVM_BASE_CURRENT}inf_diario_fi_{yyyymm}.zip"
                 log(f"  CVM {yyyymm}: {url}")
-                r = requests.get(url, headers=_CVM_HEADERS, timeout=90)
+                r = _cvm_get(url, log)
                 if r.status_code != 200 or len(r.content) < 1000:
                     log(f"  ! {yyyymm} unavailable (status {r.status_code})")
                     continue
@@ -163,8 +208,10 @@ def fetch_cvm_months(months, cnpjs, log=print):
                             parsed = _parse_cvm_csv(zf.read(nm), yyyymm, cnpjs)
                             if parsed is not None and not parsed.empty:
                                 frames.append(parsed)
-        except requests.exceptions.Timeout:
-            log(f"  ! timeout on {yyyymm}")
+        except CVMUnreachableError:
+            # Host is unreachable — abort the whole fetch immediately rather than
+            # trying every remaining month at a full timeout each.
+            raise
         except zipfile.BadZipFile:
             log(f"  ! corrupt zip on {yyyymm}")
         except Exception as e:  # noqa
