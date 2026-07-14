@@ -108,9 +108,18 @@ def update_fund_navs(cfg, release, tracked_cnpjs, full_rebuild: bool) -> pd.Data
         fresh_new = pd.DataFrame(columns=NAV_COLUMNS,
                                  index=pd.DatetimeIndex([], name="DT_COMPTC"))
 
-    # 3) Drop the refetch-window rows from the cache (replaced wholesale).
+    # 3) Drop from the cache ONLY the refetch-window months we actually
+    #    re-fetched. If a month came back empty (e.g. a transient CVM issue or a
+    #    not-yet-published current-month file), we keep the cached copy instead
+    #    of wiping it — a failed download must never delete good data.
     cache_yyyymm = _index_yyyymm(cache.index)
-    cache_keep = cache[~np.isin(cache_yyyymm, refetch)]
+    fetched_recent = (set(_index_yyyymm(fresh_recent.index))
+                      if not fresh_recent.empty else set())
+    months_to_replace = [m for m in refetch if m in fetched_recent]
+    if not months_to_replace:
+        logger.warning("Funds: refetch window returned no data (%s) — keeping "
+                       "cached months intact.", refetch)
+    cache_keep = cache[~np.isin(cache_yyyymm, months_to_replace)]
 
     combined = pd.concat([cache_keep, fresh_recent, fresh_new])
     combined = _dedup(combined)
