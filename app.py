@@ -1901,7 +1901,9 @@ def create_combined_rachev_var_chart(returns_data, var_val, cvar_val, frequency=
     
     # KDE curve
     if len(returns_pct) > 1:
-        kde = gaussian_kde(returns_pct.dropna())
+        returns_clean = pd.to_numeric(returns_pct, errors="coerce").dropna()
+        kde = gaussian_kde(returns_clean)
+        
         x_range = np.linspace(returns_pct.min(), returns_pct.max(), 500)
         kde_values = kde(x_range)
         
@@ -7440,7 +7442,9 @@ CREATE INDEX idx_etf_risk_monitor_funds_user_id ON etf_risk_monitor_funds(user_i
                     # KDE curve
                     if len(returns_pct.dropna()) > 1:
                         from scipy.stats import gaussian_kde
-                        kde = gaussian_kde(returns_pct.dropna())
+                        returns_clean = pd.to_numeric(returns_pct, errors="coerce").dropna()
+                        kde = gaussian_kde(returns_clean)
+                        
                         x_range = np.linspace(returns_pct.min(), returns_pct.max(), 300)
                         kde_values = kde(x_range)
                         
@@ -7471,7 +7475,9 @@ CREATE INDEX idx_etf_risk_monitor_funds_user_id ON etf_risk_monitor_funds(user_i
                     # Latest return point
                     if latest_pct is not None and len(returns_pct.dropna()) > 1:
                         from scipy.stats import gaussian_kde
-                        kde = gaussian_kde(returns_pct.dropna())
+                        returns_clean = pd.to_numeric(returns_pct, errors="coerce").dropna()
+                        kde = gaussian_kde(returns_clean)
+                        
                         y_pos = kde(latest_pct)[0]
                         
                         if var_95 is not None and latest_pct <= var_95:
@@ -12605,7 +12611,9 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
             
             # KDE curve
             if len(returns_pct.dropna()) > 1:
-                kde = gaussian_kde(returns_pct.dropna())
+                returns_clean = pd.to_numeric(returns_pct, errors="coerce").dropna()
+                kde = gaussian_kde(returns_clean)
+                
                 x_range = np.linspace(returns_pct.min(), returns_pct.max(), 300)
                 kde_values = kde(x_range)
                 
@@ -12654,7 +12662,9 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
             # Latest return point
             if latest_pct is not None and len(returns_pct.dropna()) > 1:
                 # Get KDE value at latest return for y position
-                kde = gaussian_kde(returns_pct.dropna())
+                returns_clean = pd.to_numeric(returns_pct, errors="coerce").dropna()
+                kde = gaussian_kde(returns_clean)
+                
                 y_pos = kde(latest_pct)[0]
                 
                 # Determine color based on position
