@@ -11122,7 +11122,7 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
                             
                             with vol_chart_col:
                                 fig_vol = create_rolling_vol_chart(portfolio_returns, window_months=12)
-                                st.plotly_chart(fig_vol, use_container_width=True)
+                                st.plotly_chart(fig_vol, use_container_width=True, key="grafico_vol")
                             
                             with vol_metrics_col:
                                 vol_12m = PortfolioMetrics.annualized_volatility(portfolio_returns.tail(252))
@@ -11146,7 +11146,7 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
                             
                             with dd_chart_col:
                                 fig_underwater, max_dd_info = create_underwater_plot(portfolio_returns)
-                                st.plotly_chart(fig_underwater, use_container_width=True)
+                                st.plotly_chart(fig_underwater, use_container_width=True, key="grafico_underwater")
                             
                             with dd_metrics_col:
                                 mdd = PortfolioMetrics.max_drawdown(portfolio_returns)
