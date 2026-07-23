@@ -11091,8 +11091,8 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
                             sharpe_chart_col, sharpe_metrics_col = st.columns([3, 1])
                             
                             with sharpe_chart_col:
-                                fig_sharpe_rp = create_rolling_sharpe_chart(portfolio_returns, window_months=12)
-                                st.plotly_chart(fig_sharpe_rp, use_container_width=True)
+                                fig_sharpe = create_rolling_sharpe_chart(portfolio_returns, window_months=12)
+                                st.plotly_chart(fig_sharpe, use_container_width=True, key="grafico_sharpe")
                             
                             with sharpe_metrics_col:
                                 sharpe_12m = PortfolioMetrics.sharpe_ratio(portfolio_returns.tail(252))
