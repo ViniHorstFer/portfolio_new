@@ -75,7 +75,14 @@ def gross_up_tax_exempt_navs(fundos_info, result_df, tax_rate=0.15):
         alpha = daily_return_target - daily_return_net
         
         # Calculate actual daily returns from original NAV series
+        fund_data = fund_data.copy()
+        fund_data["VL_QUOTA"] = pd.to_numeric(fund_data["VL_QUOTA"], errors="coerce")
+        fund_data.loc[fund_data["VL_QUOTA"] <= 0, "VL_QUOTA"] = np.nan  # zero/negative quota = bad data, not a real return
+    
         daily_returns = fund_data["VL_QUOTA"].pct_change().fillna(0).values
+
+        bad = fund_data[(fund_data["VL_QUOTA"].isna()) | (fund_data["VL_QUOTA"] == 0)]
+        print(bad[["CNPJ_FUNDO", "DT_COMPTC", "VL_QUOTA"]] if "CNPJ_FUNDO" in fund_data.columns else bad)
         
         # Apply additive adjustment to each daily return
         adjusted_returns = daily_returns + alpha
