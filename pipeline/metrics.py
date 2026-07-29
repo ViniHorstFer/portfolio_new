@@ -77,12 +77,16 @@ def gross_up_tax_exempt_navs(fundos_info, result_df, tax_rate=0.15):
         # Calculate actual daily returns from original NAV series
         fund_data = fund_data.copy()
         fund_data["VL_QUOTA"] = pd.to_numeric(fund_data["VL_QUOTA"], errors="coerce")
-        fund_data.loc[fund_data["VL_QUOTA"] <= 0, "VL_QUOTA"] = np.nan  # zero/negative quota = bad data, not a real return
+        bad_mask = fund_data["VL_QUOTA"].isna() | (fund_data["VL_QUOTA"] <= 0)
+        fund_data.loc[bad_mask, "VL_QUOTA"] = np.nan
+    
+        if bad_mask.any():
+            cols_to_show = [c for c in ["CNPJ_FUNDO", "DT_COMPTC", "VL_QUOTA"] if c in fund_data.columns]
+            print(f"[gross_up_tax_exempt_navs] {bad_mask.sum()} bad VL_QUOTA rows found. "
+                  f"Columns available: {list(fund_data.columns)}")
+            print(fund_data.loc[bad_mask, cols_to_show] if cols_to_show else fund_data.loc[bad_mask])
     
         daily_returns = fund_data["VL_QUOTA"].pct_change().fillna(0).values
-
-        bad = fund_data[(fund_data["VL_QUOTA"].isna()) | (fund_data["VL_QUOTA"] == 0)]
-        print(bad[["CNPJ_FUNDO", "DT_COMPTC", "VL_QUOTA"]] if "CNPJ_FUNDO" in fund_data.columns else bad)
         
         # Apply additive adjustment to each daily return
         adjusted_returns = daily_returns + alpha
