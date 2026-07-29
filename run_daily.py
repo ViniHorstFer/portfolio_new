@@ -36,6 +36,10 @@ warnings.filterwarnings(
     category=FutureWarning,
 )
 
+from pandas.errors import Pandas4Warning
+
+warnings.filterwarnings("ignore", category=Pandas4Warning)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
