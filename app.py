@@ -12997,19 +12997,23 @@ CREATE POLICY "Allow all operations" ON risk_monitor_funds
                     # Rename "-" to "Multimercado"
                     if pd.isna(subcategory) or subcategory == '-' or subcategory == '':
                         subcategory = 'Multimercado'
+                    category = fund_row['CATEGORIA BTG'].iloc[0] if 'CATEGORIA BTG' in fund_row.columns else 'Other'
+                    if pd.isna(category) or category == '-' or category == '':
+                        category = 'Other'
                     cnpj = fund_row['CNPJ'].iloc[0] if 'CNPJ' in fund_row.columns else None
                     cnpj_standard = fund_row['CNPJ_STANDARD'].iloc[0] if 'CNPJ_STANDARD' in fund_row.columns else standardize_cnpj(cnpj) if cnpj else None
                     update = fund_row['LAST_UPDATE'].iloc[0] if 'LAST_UPDATE' in fund_row.columns else 'N/A'
                     
                     fund_info_list.append({
                         'name': fund_name,
+                        'category': category,
                         'subcategory': subcategory,
                         'cnpj_standard': cnpj_standard,
                         'update': pd.to_datetime(update).strftime('%d/%b')
                     })
             
-            # Sort by sub-category, then alphabetically by name
-            fund_info_list = sorted(fund_info_list, key=lambda x: (x['subcategory'], x['name']))
+            # Sort by category, then sub-category, then alphabetically by name
+            fund_info_list = sorted(fund_info_list, key=lambda x: (x['category'], x['subcategory'], x['name']))
             
             # ═══════════════════════════════════════════════════════════════════
             # CACHED METRICS CALCULATION
@@ -13100,6 +13104,41 @@ CREATE POLICY "Allow all operations" ON risk_monitor_funds
                     text-align: left;
                     padding-left: 20px;
                 }
+                .risk-table .category-header td {
+                    background: linear-gradient(90deg, #FFD700 0%, #8a6d0b 100%);
+                    color: #000000;
+                    font-weight: 800;
+                    font-size: 13px;
+                    letter-spacing: 1.5px;
+                    text-transform: uppercase;
+                    text-align: left;
+                    padding: 9px 14px;
+                    border-top: 2px solid #FFD700;
+                }
+                .risk-table .subcategory-header td {
+                    background-color: #262626;
+                    color: #FFD700;
+                    font-weight: 600;
+                    font-size: 12px;
+                    text-align: left;
+                    padding: 5px 14px 5px 26px;
+                    border-left: 3px solid #FFD700;
+                    letter-spacing: 0.5px;
+                }
+                .risk-table .benchmark-row td {
+                    background-color: #10202b;
+                    font-weight: 600;
+                    border-top: 1px solid #2b6cb0;
+                    border-bottom: 1px solid #2b6cb0;
+                }
+                .risk-table td.cdi-cell {
+                    border-left: 1px solid #444;
+                    font-size: 15px;
+                    font-weight: 700;
+                }
+                .risk-table th.cdi-th {
+                    border-left: 2px solid #8a6d0b;
+                }
             </style>
             """
             
@@ -13113,6 +13152,49 @@ CREATE POLICY "Allow all operations" ON risk_monitor_funds
                 # ═══════════════════════════════════════════════════════════════
                 st.markdown("### 📊 Risk Summary - Returns & NNM%")
                 
+                # ── Benchmark (CDI) metrics — computed once, cached in session ──
+                CDI_FUND_NAME = 'RENDA FIXA CDI'
+                if st.session_state.get('cdi_risk_hash') != funds_hash:
+                    cdi_info = None
+                    cdi_row_df = fund_metrics[fund_metrics['FUNDO DE INVESTIMENTO'] == CDI_FUND_NAME]
+                    if len(cdi_row_df) > 0 and fund_details is not None:
+                        _c_cnpj = cdi_row_df['CNPJ_STANDARD'].iloc[0] if 'CNPJ_STANDARD' in cdi_row_df.columns else standardize_cnpj(cdi_row_df['CNPJ'].iloc[0])
+                        _c_upd = cdi_row_df['LAST_UPDATE'].iloc[0] if 'LAST_UPDATE' in cdi_row_df.columns else 'N/A'
+                        _c_res = get_fund_returns(fund_details, _c_cnpj, period_months=None)
+                        if _c_res is not None:
+                            _c_daily = _c_res[0]
+                            cdi_info = {
+                                'name': CDI_FUND_NAME, 'category': 'CDI', 'subcategory': '',
+                                'update': pd.to_datetime(_c_upd).strftime('%d/%b') if _c_upd != 'N/A' else 'N/A',
+                                'metrics': {
+                                    'daily': calculate_risk_metrics_cached(get_returns_for_frequency(_c_daily, 'daily')),
+                                    'weekly': calculate_risk_metrics_cached(get_returns_for_frequency(_c_daily, 'weekly')),
+                                    'monthly': calculate_risk_metrics_cached(get_returns_for_frequency(_c_daily, 'monthly')),
+                                },
+                            }
+                    st.session_state['cdi_risk_info'] = cdi_info
+                    st.session_state['cdi_risk_hash'] = funds_hash
+                cdi_info = st.session_state.get('cdi_risk_info')
+                
+                cdi_returns = {'daily': None, 'weekly': None, 'monthly': None}
+                if cdi_info:
+                    for _f in ['daily', 'weekly', 'monthly']:
+                        _m = cdi_info['metrics'].get(_f)
+                        cdi_returns[_f] = _m.get('return') if _m else None
+                
+                # Benchmark first, then the funds (already sorted by category / sub-category)
+                summary_list = ([cdi_info] if cdi_info else []) + [f for f in fund_info_list if f['name'] != CDI_FUND_NAME]
+                thresholds = {'daily': 2.5, 'weekly': 5.0, 'monthly': 7.5}
+                
+                def _cdi_arrow(fund_ret, cdi_ret, is_bench):
+                    if is_bench or fund_ret is None or cdi_ret is None or pd.isna(fund_ret) or pd.isna(cdi_ret):
+                        return '<td class="cdi-cell" style="color:#777;">–</td>'
+                    if fund_ret > cdi_ret:
+                        return '<td class="cdi-cell" style="color:#00C853;">▲</td>'
+                    if fund_ret < cdi_ret:
+                        return '<td class="cdi-cell" style="color:#FF5252;">▼</td>'
+                    return '<td class="cdi-cell" style="color:#BBBBBB;">–</td>'
+                
                 html = table_style + """
                 <table class="risk-table">
                     <tr>
@@ -13123,34 +13205,37 @@ CREATE POLICY "Allow all operations" ON risk_monitor_funds
                         <th colspan="2">DAILY</th>
                         <th colspan="2">WEEKLY</th>
                         <th colspan="2">MONTHLY</th>
+                        <th colspan="3" class="cdi-th">CDI</th>
                     </tr>
                     <tr>
-                        <th>RETURN</th>
-                        <th>NNM%</th>
-                        <th>RETURN</th>
-                        <th>NNM%</th>
-                        <th>RETURN</th>
-                        <th>NNM%</th>
+                        <th>RETURN</th><th>NNM%</th>
+                        <th>RETURN</th><th>NNM%</th>
+                        <th>RETURN</th><th>NNM%</th>
+                        <th class="cdi-th">D</th><th>W</th><th>M</th>
                     </tr>
                 """
                 
+                current_category = None
                 current_subcategory = None
+                export_rows = []
                 
-                for fund_info in fund_info_list:
+                for fund_info in summary_list:
                     fund_name = fund_info['name']
-                    subcategory = fund_info['subcategory']
-                    fund_last_update = fund_info['update']
+                    category = fund_info.get('category', 'Other')
+                    subcategory = fund_info.get('subcategory', '')
+                    is_bench = (category == 'CDI')
+                    fund_last_update = fund_info.get('update', 'N/A')
+                    data = fund_info.get('metrics') or fund_metrics_data.get(fund_name, {})
+                    flow = {} if is_bench else fund_flow_data.get(fund_name, {})
                     
-                    # Sub-category separator row
-                    if subcategory != current_subcategory:
-                        html += f'<tr class="category-row"><td colspan="10">{subcategory}</td></tr>'
+                    if category != current_category:
+                        html += f'<tr class="category-header"><td colspan="13">{category}</td></tr>'
+                        current_category = category
+                        current_subcategory = None
+                    if subcategory and subcategory != current_subcategory:
+                        html += f'<tr class="subcategory-header"><td colspan="13">{subcategory}</td></tr>'
                         current_subcategory = subcategory
                     
-                    # Get returns data
-                    data = fund_metrics_data.get(fund_name, {})
-                    flow = fund_flow_data.get(fund_name, {})
-                    
-                    # Calculate Returns status (based on VaR comparison)
                     returns_statuses = []
                     for freq in ['daily', 'weekly', 'monthly']:
                         if data.get(freq):
@@ -13164,7 +13249,6 @@ CREATE POLICY "Allow all operations" ON risk_monitor_funds
                                     returns_statuses.append('good')
                                 else:
                                     returns_statuses.append('normal')
-                    
                     if 'bad' in returns_statuses:
                         returns_status = '‼️'
                     elif 'good' in returns_statuses:
@@ -13174,54 +13258,118 @@ CREATE POLICY "Allow all operations" ON risk_monitor_funds
                     else:
                         returns_status = '❓'
                     
-                    # Calculate NNM status (based on flow thresholds)
-                    nnm_statuses = []
-                    thresholds = {'daily': 2.5, 'weekly': 5.0, 'monthly': 7.5}
-                    for freq, threshold in thresholds.items():
-                        nnm_pct = flow.get(f'{freq}_transfers_pct', 0)
-                        if nnm_pct is not None:
-                            if nnm_pct <= -threshold:
-                                nnm_statuses.append('bad')
-                            elif nnm_pct >= threshold:
-                                nnm_statuses.append('good')
-                            else:
-                                nnm_statuses.append('normal')
-                    
-                    if 'bad' in nnm_statuses:
-                        nnm_status = '‼️'
-                    elif 'good' in nnm_statuses:
-                        nnm_status = '✅'
-                    elif nnm_statuses:
-                        nnm_status = '🆗'
+                    if is_bench:
+                        nnm_status = '–'
                     else:
-                        nnm_status = '❓'
+                        nnm_statuses = []
+                        for freq, threshold in thresholds.items():
+                            nnm_pct = flow.get(f'{freq}_transfers_pct', 0)
+                            if nnm_pct is not None:
+                                if nnm_pct <= -threshold:
+                                    nnm_statuses.append('bad')
+                                elif nnm_pct >= threshold:
+                                    nnm_statuses.append('good')
+                                else:
+                                    nnm_statuses.append('normal')
+                        if 'bad' in nnm_statuses:
+                            nnm_status = '‼️'
+                        elif 'good' in nnm_statuses:
+                            nnm_status = '✅'
+                        elif nnm_statuses:
+                            nnm_status = '🆗'
+                        else:
+                            nnm_status = '❓'
                     
-                    html += f'<tr><td class="fund-name">{fund_name}</td><td>{fund_last_update}</td><td>{returns_status}</td><td>{nnm_status}</td>'
+                    row_class = ' class="benchmark-row"' if is_bench else ''
+                    html += f'<tr{row_class}><td class="fund-name">{fund_name}</td><td>{fund_last_update}</td><td>{returns_status}</td><td>{nnm_status}</td>'
+                    
+                    exp = {'Category': category, 'Sub-Category': ('' if is_bench else subcategory),
+                           'Investment Fund': fund_name, 'Date': fund_last_update,
+                           'Returns Status': returns_status, 'NNM Status': nnm_status}
                     
                     for freq in ['daily', 'weekly', 'monthly']:
-                        # Return column
-                        if data.get(freq):
-                            ret = data[freq].get('return')
+                        _lbl = freq.capitalize()
+                        ret = data[freq].get('return') if data.get(freq) else None
+                        if data.get(freq) and ret is not None:
                             var_95 = data[freq].get('var_95')
                             var_5 = data[freq].get('var_5')
-                            ret_color = get_risk_color(ret, var_95, var_5) if ret is not None else '#888888'
+                            ret_color = get_risk_color(ret, var_95, var_5)
                             html += f'<td style="color: {ret_color};">{format_pct(ret)}</td>'
                         else:
                             html += '<td>N/A</td>'
+                        exp[f'{_lbl} Return (%)'] = round(ret * 100, 4) if (ret is not None and not pd.isna(ret)) else None
                         
-                        # NNM% column
-                        nnm_pct = flow.get(f'{freq}_transfers_pct', None)
-                        threshold = thresholds[freq]
-                        if nnm_pct is not None:
-                            nnm_color = get_flow_color(nnm_pct, threshold)
-                            html += f'<td style="color: {nnm_color};">{nnm_pct:+.2f}%</td>'
+                        if is_bench:
+                            html += '<td>–</td>'
+                            exp[f'{_lbl} NNM (%)'] = None
                         else:
-                            html += '<td>N/A</td>'
+                            nnm_pct = flow.get(f'{freq}_transfers_pct', None)
+                            if nnm_pct is not None:
+                                nnm_color = get_flow_color(nnm_pct, thresholds[freq])
+                                html += f'<td style="color: {nnm_color};">{nnm_pct:+.2f}%</td>'
+                                exp[f'{_lbl} NNM (%)'] = round(float(nnm_pct), 4)
+                            else:
+                                html += '<td>N/A</td>'
+                                exp[f'{_lbl} NNM (%)'] = None
+                    
+                    for freq in ['daily', 'weekly', 'monthly']:
+                        fret = data[freq].get('return') if data.get(freq) else None
+                        html += _cdi_arrow(fret, cdi_returns[freq], is_bench)
+                        _k = 'CDI ' + freq[0].upper()
+                        if is_bench:
+                            exp[_k] = 'Benchmark'
+                        elif fret is None or cdi_returns[freq] is None or pd.isna(fret) or pd.isna(cdi_returns[freq]):
+                            exp[_k] = 'N/A'
+                        elif fret > cdi_returns[freq]:
+                            exp[_k] = 'Outperform'
+                        elif fret < cdi_returns[freq]:
+                            exp[_k] = 'Underperform'
+                        else:
+                            exp[_k] = 'In line'
                     
                     html += '</tr>'
+                    export_rows.append(exp)
                 
                 html += '</table>'
                 render_html_table(html)
+                
+                # ── Export to Excel (clean, structured — feeds downstream systems) ──
+                try:
+                    import io as _io
+                    from openpyxl.styles import Font, PatternFill, Alignment
+                    from openpyxl.utils import get_column_letter
+                    export_df = pd.DataFrame(export_rows)
+                    _buf = _io.BytesIO()
+                    with pd.ExcelWriter(_buf, engine='openpyxl') as _writer:
+                        export_df.to_excel(_writer, index=False, sheet_name='Risk Summary', startrow=1)
+                        _ws = _writer.sheets['Risk Summary']
+                        _ncol = len(export_df.columns)
+                        _ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=_ncol)
+                        _title = _ws.cell(row=1, column=1,
+                                          value='Risk Summary — Returns & NNM%  |  Benchmark: CDI (RENDA FIXA CDI)  |  Generated ' + pd.Timestamp.now().strftime('%Y-%m-%d %H:%M'))
+                        _title.font = Font(bold=True, size=12, color='000000')
+                        _title.alignment = Alignment(horizontal='left')
+                        _hdr_fill = PatternFill('solid', fgColor='FFD700')
+                        for _c in range(1, _ncol + 1):
+                            _cell = _ws.cell(row=2, column=_c)
+                            _cell.font = Font(bold=True, color='000000')
+                            _cell.fill = _hdr_fill
+                            _cell.alignment = Alignment(horizontal='center', vertical='center')
+                        for _i, _col in enumerate(export_df.columns, start=1):
+                            _vals = [len(str(_col))] + [len(str(v)) for v in export_df[_col].tolist()]
+                            _ws.column_dimensions[get_column_letter(_i)].width = min(40, max(12, max(_vals) + 2))
+                        _ws.freeze_panes = 'A3'
+                        _ws.auto_filter.ref = f"A2:{get_column_letter(_ncol)}{len(export_df) + 2}"
+                    _buf.seek(0)
+                    st.download_button(
+                        label="⬇️  Export table to Excel (.xlsx)",
+                        data=_buf.getvalue(),
+                        file_name=f"risk_summary_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="risk_summary_xlsx_export",
+                    )
+                except Exception as _e:
+                    st.caption(f"Excel export unavailable: {_e}")
                 
                 st.markdown("""
                 **Legend:**
@@ -13230,6 +13378,7 @@ CREATE POLICY "Allow all operations" ON risk_monitor_funds
                 - **Thresholds**: Daily ±2.5% | Weekly ±5.0% | Monthly ±7.5%
                 - **RETURN**: Colored from 🔴 VaR(95) to 🟢 VaR(5)
                 - **NNM%**: Colored from 🔴 negative to 🟢 positive (relative to AUM)
+                - **CDI (D / W / M)**: performance vs the CDI benchmark — ▲ outperformed, ▼ underperformed, – in line (daily / weekly / monthly)
                 """)
             
             elif frequency_option == "📈 Returns":
