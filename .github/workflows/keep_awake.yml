@@ -14,6 +14,9 @@ concurrency:
   group: keep-awake
   cancel-in-progress: false
 
+env:
+  STREAMLIT_URL: https://portfolio-selection.streamlit.app
+
 jobs:
   visit:
     runs-on: ubuntu-latest
