@@ -15,7 +15,7 @@ import sys
 
 from playwright.sync_api import sync_playwright
 
-URL = os.environ.get("https://portfolio-selection.streamlit.app/", "").strip()
+URL = os.environ.get("STREAMLIT_URL", "").strip()
 
 # Texto do botão da página "This app has gone to sleep" (mantido amplo por
 # robustez, caso o Streamlit mude a frase exata).
