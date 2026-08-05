@@ -2298,111 +2298,6 @@ class PortfolioMetrics:
 # RECOMMENDED PORTFOLIO HELPER FUNCTIONS  
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def calendar_period_returns(daily_returns, today=None):
-    """Calendar-period returns ending at the last day of the PREVIOUS month
-    (not rolling windows). Returns a dict of decimal-fraction returns:
-    label (e.g. 'Jul/2026'), last_month, m3, m6, ytd, m12 — None where the
-    history does not cover the period."""
-    if daily_returns is None:
-        return None
-    s = pd.Series(daily_returns).dropna()
-    if s.empty:
-        return None
-    s.index = pd.to_datetime(s.index)
-    cum = (1 + s).cumprod()
-    m = cum.resample('ME').last().dropna()
-    if m.empty:
-        return None
-    m.index = m.index.to_period('M')
-    today = today if today is not None else pd.Timestamp.today()
-    prev = today.to_period('M') - 1  # last completed month
-
-    def _r(t_end, t_start):
-        if t_end in m.index and t_start in m.index and m.loc[t_start] != 0:
-            return float(m.loc[t_end] / m.loc[t_start] - 1)
-        return None
-
-    dec_prev = pd.Period(year=prev.year - 1, month=12, freq='M')
-    return {
-        'label': prev.strftime('%b/%Y'),
-        'last_month': _r(prev, prev - 1),
-        'm3': _r(prev, prev - 3),
-        'm6': _r(prev, prev - 6),
-        'ytd': _r(prev, dec_prev),
-        'm12': _r(prev, prev - 12),
-    }
-
-
-def _report_xlsx_common(writer, df, sheet_name, title):
-    from openpyxl.styles import Font, PatternFill, Alignment
-    df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=1)
-    ws = writer.sheets[sheet_name]
-    ncol = len(df.columns)
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncol)
-    _t = ws.cell(row=1, column=1, value=title)
-    _t.font = Font(bold=True, size=12)
-    _t.alignment = Alignment(horizontal='left')
-    _fill = PatternFill('solid', fgColor='FFD700')
-    for _c in range(1, ncol + 1):
-        _cell = ws.cell(row=2, column=_c)
-        _cell.font = Font(bold=True, color='000000')
-        _cell.fill = _fill
-        _cell.alignment = Alignment(horizontal='center', vertical='center')
-    return ws, ncol
-
-
-def _autosize_and_freeze(ws, df, ncol):
-    from openpyxl.utils import get_column_letter
-    for _i, _col in enumerate(df.columns, start=1):
-        _vals = [len(str(_col))] + [len(str(v)) for v in df[_col].tolist()]
-        ws.column_dimensions[get_column_letter(_i)].width = min(42, max(11, max(_vals) + 2))
-    ws.freeze_panes = 'A3'
-    ws.auto_filter.ref = f"A2:{get_column_letter(ncol)}{len(df) + 2}"
-
-
-def build_period_report_xlsx(df, pct_cols, title, sheet_name='Report', pct_format='0.00%'):
-    """xlsx bytes for a period-returns report; decimal fractions in pct_cols
-    are shown as percentages."""
-    import io as _io
-    _buf = _io.BytesIO()
-    with pd.ExcelWriter(_buf, engine='openpyxl') as _w:
-        ws, ncol = _report_xlsx_common(_w, df, sheet_name, title)
-        _col_idx = {name: i + 1 for i, name in enumerate(df.columns)}
-        for name in pct_cols:
-            if name in _col_idx:
-                _ci = _col_idx[name]
-                for _rw in range(3, 3 + len(df)):
-                    _cell = ws.cell(row=_rw, column=_ci)
-                    if isinstance(_cell.value, (int, float)):
-                        _cell.number_format = pct_format
-        _autosize_and_freeze(ws, df, ncol)
-    _buf.seek(0)
-    return _buf.getvalue()
-
-
-def build_portfolio_report_xlsx(df, period_cols, title, sheet_name='Report'):
-    """xlsx bytes for the per-portfolio report. Return/CDI rows are formatted as
-    percentages; the '% CDI' row is formatted as a plain percent-of-CDI number."""
-    import io as _io
-    _buf = _io.BytesIO()
-    with pd.ExcelWriter(_buf, engine='openpyxl') as _w:
-        ws, ncol = _report_xlsx_common(_w, df, sheet_name, title)
-        _col_idx = {name: i + 1 for i, name in enumerate(df.columns)}
-        _metric_vals = list(df['Metric']) if 'Metric' in df.columns else []
-        for _ri, _metric in enumerate(_metric_vals):
-            _excel_row = 3 + _ri
-            for name in period_cols:
-                _ci = _col_idx.get(name)
-                if not _ci:
-                    continue
-                _cell = ws.cell(row=_excel_row, column=_ci)
-                if isinstance(_cell.value, (int, float)):
-                    _cell.number_format = '0"%"' if _metric == '% CDI' else '0.00%'
-        _autosize_and_freeze(ws, df, ncol)
-    _buf.seek(0)
-    return _buf.getvalue()
-
-
 def calculate_portfolio_returns(fund_returns_dict, allocations):
     """Calculate portfolio returns based on weighted average of fund returns."""
     total_alloc = sum(allocations.values())
@@ -10863,7 +10758,6 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
                                         loaded = load_portfolio_from_supabase(selected_portfolio, current_user)
                                         if loaded:
                                             st.session_state['recommended_portfolio'] = loaded
-                                            st.session_state['recommended_portfolio_name'] = selected_portfolio
                                             st.session_state['recommended_portfolio_saved'] = True
                                             st.session_state['temp_portfolio'] = loaded.copy()
                                             if 'inv_fund_tables_computed' in st.session_state:
@@ -10890,7 +10784,6 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
                                     loaded = load_portfolio_from_supabase(selected_portfolio, current_user)
                                     if loaded:
                                         st.session_state['recommended_portfolio'] = loaded
-                                        st.session_state['recommended_portfolio_name'] = selected_portfolio
                                         st.session_state['recommended_portfolio_saved'] = True
                                         st.session_state['temp_portfolio'] = loaded.copy()
                                         if 'inv_fund_tables_computed' in st.session_state:
@@ -10932,45 +10825,6 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
                     # Normalize weights
                     total_alloc = sum(portfolio.values())
                     weights_series = pd.Series({k: v / total_alloc for k, v in portfolio.items()})
-                    
-                    # ── Monthly Report vs CDI (calendar periods, previous month-end) ──
-                    st.markdown("#### 📄 Monthly Report (vs CDI)")
-                    st.caption("Calendar-period returns (not rolling) up to the last day of the previous month.")
-                    if st.button("Generate monthly report (.xlsx)", key="rec_monthly_report_btn"):
-                        _pname = st.session_state.get('recommended_portfolio_name', 'Recommended Portfolio')
-                        _frd = {fn: get_fund_returns_by_name(fn, fund_metrics, fund_details) for fn in portfolio.keys()}
-                        _frd = {k: v for k, v in _frd.items() if v is not None}
-                        _pret = calculate_portfolio_returns(_frd, portfolio) if _frd else None
-                        _cdi = benchmarks['CDI'] if 'CDI' in benchmarks.columns else None
-                        _pp = calendar_period_returns(_pret) if _pret is not None else None
-                        _cp = calendar_period_returns(_cdi) if _cdi is not None else None
-                        _lbl = (_pp or {}).get('label') or (_cp or {}).get('label') or 'Last Month'
-                        _keys = ['last_month', 'm3', 'm6', 'ytd', 'm12']
-                        _cols = [_lbl, '3 Months', '6 Months', 'YTD', '12 Months']
-                        def _rel(p, c):
-                            if p is None or c is None or c <= 0:
-                                return 'N/A'
-                            if p < 0:
-                                return '-'
-                            return round(p / c * 100, 1)
-                        _rows = [
-                            {'Portfolio': _pname, 'Metric': 'Return',
-                             **{cn: ((_pp or {}).get(k)) for cn, k in zip(_cols, _keys)}},
-                            {'Portfolio': '', 'Metric': 'CDI',
-                             **{cn: ((_cp or {}).get(k)) for cn, k in zip(_cols, _keys)}},
-                            {'Portfolio': '', 'Metric': '% CDI',
-                             **{cn: _rel((_pp or {}).get(k), (_cp or {}).get(k)) for cn, k in zip(_cols, _keys)}},
-                        ]
-                        _pdf = pd.DataFrame(_rows)
-                        st.session_state['rec_monthly_report'] = build_portfolio_report_xlsx(
-                            _pdf, _cols, title=f"{_pname} — Monthly Returns vs CDI (up to {_lbl})")
-                    if st.session_state.get('rec_monthly_report'):
-                        st.download_button(
-                            "⬇️  Download monthly report (.xlsx)",
-                            data=st.session_state['rec_monthly_report'],
-                            file_name=f"portfolio_monthly_report_{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key="rec_monthly_report_dl")
                     
                     # Pie chart view selector buttons
                     view_col1, view_col2, view_col3 = st.columns(3)
@@ -13211,44 +13065,6 @@ CREATE POLICY "Allow all operations" ON risk_monitor_funds
             else:
                 fund_metrics_data = st.session_state[f'risk_metrics_cache_{funds_hash}']
                 fund_flow_data = st.session_state.get(f'risk_flow_cache_{funds_hash}', {})
-            
-            # ── Monthly Investment Report (calendar periods, up to previous month-end) ──
-            st.markdown("#### 📄 Monthly Investment Report")
-            st.caption("Calendar-period returns (not rolling) up to the last day of the previous month.")
-            if st.button("Generate monthly report (.xlsx)", key="risk_monthly_report_btn"):
-                _rep_rows = []
-                _lbl = None
-                for _fi in fund_info_list:
-                    _cnpj = _fi.get('cnpj_standard')
-                    _pr = None
-                    if _cnpj and fund_details is not None:
-                        _res = get_fund_returns(fund_details, _cnpj, period_months=None)
-                        if _res is not None:
-                            _pr = calendar_period_returns(_res[0])
-                    if _pr is None:
-                        _pr = {'label': None, 'last_month': None, 'm3': None, 'm6': None, 'ytd': None, 'm12': None}
-                    if _pr.get('label'):
-                        _lbl = _pr['label']
-                    _rep_rows.append({
-                        'Category': _fi.get('category', ''),
-                        'Sub-Category': _fi.get('subcategory', ''),
-                        'Investment Fund': _fi['name'],
-                        '__last': _pr['last_month'], '__m3': _pr['m3'], '__m6': _pr['m6'],
-                        '__ytd': _pr['ytd'], '__m12': _pr['m12'],
-                    })
-                _lbl = _lbl or 'Last Month'
-                _rename = {'__last': _lbl, '__m3': '3 Months', '__m6': '6 Months', '__ytd': 'YTD', '__m12': '12 Months'}
-                _df = pd.DataFrame(_rep_rows).rename(columns=_rename)
-                _pct_cols = [_lbl, '3 Months', '6 Months', 'YTD', '12 Months']
-                st.session_state['risk_monthly_report'] = build_period_report_xlsx(
-                    _df, _pct_cols, title=f"Monthly Fund Returns — up to {_lbl} (calendar periods)")
-            if st.session_state.get('risk_monthly_report'):
-                st.download_button(
-                    "⬇️  Download monthly report (.xlsx)",
-                    data=st.session_state['risk_monthly_report'],
-                    file_name=f"monthly_fund_returns_{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="risk_monthly_report_dl")
             
             # ═══════════════════════════════════════════════════════════════════
             # COMMON TABLE STYLES
