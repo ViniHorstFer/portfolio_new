@@ -2403,31 +2403,178 @@ def build_portfolio_report_xlsx(df, period_cols, title, sheet_name='Report'):
     return _buf.getvalue()
 
 
+
 def calculate_portfolio_returns(fund_returns_dict, allocations):
-    """Calculate portfolio returns based on weighted average of fund returns."""
+    """Weighted daily portfolio returns over the UNION of dates. On each date only the
+    funds that reported are used, with their weights renormalized — so the series stays
+    up to date instead of being truncated to the least-updated fund."""
     total_alloc = sum(allocations.values())
     if total_alloc == 0:
         return None
     weights = {k: v / total_alloc for k, v in allocations.items()}
+    cols = {}
     all_dates = None
-    for fund_name, returns in fund_returns_dict.items():
-        if fund_name in weights:
-            if all_dates is None:
-                all_dates = set(returns.index)
-            else:
-                all_dates = all_dates.intersection(set(returns.index))
+    for fn, w in weights.items():
+        r = fund_returns_dict.get(fn)
+        if r is None or len(r) == 0:
+            continue
+        cols[fn] = r
+        idx = set(r.index)
+        all_dates = idx if all_dates is None else (all_dates | idx)
     if not all_dates:
         return None
-    all_dates = sorted(list(all_dates))
-    returns_df = pd.DataFrame(index=all_dates)
-    for fund_name, weight in weights.items():
-        if fund_name in fund_returns_dict:
-            returns_df[fund_name] = fund_returns_dict[fund_name].reindex(all_dates)
-    portfolio_returns = pd.Series(0.0, index=all_dates)
-    for fund_name, weight in weights.items():
-        if fund_name in returns_df.columns:
-            portfolio_returns += returns_df[fund_name].fillna(0) * weight
-    return portfolio_returns
+    all_dates = sorted(all_dates)
+    df = pd.DataFrame(index=all_dates)
+    for fn, r in cols.items():
+        df[fn] = r.reindex(all_dates)
+    w_ser = pd.Series({fn: weights[fn] for fn in cols})
+    mask = df.notna()
+    eff = mask.mul(w_ser, axis=1)                 # weight where reported, 0 where missing
+    row_w = eff.sum(axis=1)                        # sum of reporting weights per date
+    port = (df.fillna(0) * eff).sum(axis=1) / row_w.replace(0, np.nan)
+    return port.dropna()
+
+def _fund_month_return(daily, month_end):
+    ms = month_end.replace(day=1)
+    seg = daily[(daily.index >= ms) & (daily.index <= month_end)]
+    return float((1 + seg).prod() - 1) if len(seg) > 0 else None
+
+def hub_month_grid(fund_returns_dict, n_months=12):
+    max_date = None
+    for r in fund_returns_dict.values():
+        if r is not None and len(r) > 0:
+            m = r.index.max()
+            max_date = m if (max_date is None or m > max_date) else max_date
+    if max_date is None:
+        return [], []
+    cme = max_date + pd.offsets.MonthEnd(0)
+    start = (cme - pd.DateOffset(months=n_months - 1)).replace(day=1)
+    months = pd.date_range(start=start, end=cme, freq='ME')
+    return list(months), [m.strftime('%b-%y') for m in months]
+
+def portfolio_monthly_series(fund_returns_dict, weights, months):
+    out = []
+    for me in months:
+        tot = 0.0
+        for fn, w in weights.items():
+            r = fund_returns_dict.get(fn)
+            if r is not None and w:
+                rm = _fund_month_return(r, me)
+                if rm is not None:
+                    tot += w * rm
+        out.append(tot)
+    return out
+
+def group_contributions(fund_returns_dict, weights, fund_group_map, months):
+    groups = {}
+    for fn, g in fund_group_map.items():
+        groups.setdefault(g, []).append(fn)
+    result = {}
+    for g, funds in groups.items():
+        series = []
+        for me in months:
+            tot = 0.0
+            for fn in funds:
+                w = weights.get(fn, 0)
+                r = fund_returns_dict.get(fn)
+                if r is not None and w:
+                    rm = _fund_month_return(r, me)
+                    if rm is not None:
+                        tot += w * rm
+            series.append(tot)
+        result[g] = series
+    return result
+
+def cdi_monthly_series(cdi_daily, months):
+    return [(_fund_month_return(cdi_daily, me) or 0.0) for me in months]
+
+def _cum(vals):
+    p = 1.0
+    for v in vals:
+        p *= (1 + v)
+    return p - 1
+
+def cumulative_periods(monthly_port, monthly_cdi, months):
+    n = len(monthly_port)
+    def lastk(vals, k): return vals[-k:] if k <= len(vals) else vals
+    res = {}
+    res['MTD'] = (monthly_port[-1], monthly_cdi[-1]) if n else (None, None)
+    for k, lbl in [(3,'3M'),(6,'6M'),(12,'12M')]:
+        res[lbl] = (_cum(lastk(monthly_port,k)), _cum(lastk(monthly_cdi,k)))
+    ly = months[-1].year
+    idxs = [i for i,me in enumerate(months) if me.year == ly]
+    res['YTD'] = (_cum([monthly_port[i] for i in idxs]), _cum([monthly_cdi[i] for i in idxs]))
+    return res
+
+def pct_cdi(port, cdi):
+    if port is None or cdi is None or cdi <= 0:
+        return 'N/A'
+    if port < 0:
+        return '-'
+    return round(port / cdi * 100, 1)
+
+def _write_sheet(writer, df, sheet, pct_cols):
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    df.to_excel(writer, index=False, sheet_name=sheet, startrow=0)
+    ws = writer.sheets[sheet]
+    fill = PatternFill('solid', fgColor='FFD700')
+    for c in range(1, len(df.columns) + 1):
+        cell = ws.cell(row=1, column=c); cell.font = Font(bold=True); cell.fill = fill
+        cell.alignment = Alignment(horizontal='center')
+    col_idx = {n: i + 1 for i, n in enumerate(df.columns)}
+    for name in pct_cols:
+        ci = col_idx.get(name)
+        if ci:
+            for r in range(2, 2 + len(df)):
+                cell = ws.cell(row=r, column=ci)
+                if isinstance(cell.value, (int, float)):
+                    cell.number_format = '0.00%'
+    for i, col in enumerate(df.columns, start=1):
+        vals = [len(str(col))] + [len(str(v)) for v in df[col].tolist()]
+        ws.column_dimensions[get_column_letter(i)].width = min(20, max(9, max(vals) + 2))
+    ws.freeze_panes = 'B2'
+
+def build_hub_xlsx(hub, cdi_m, months, labels):
+    import io as _io
+    buf = _io.BytesIO()
+    used = set()
+    def _uniq(s):
+        s = ''.join(ch for ch in str(s) if ch not in '[]:*?/\\')[:31] or 'Sheet'
+        base = s; i = 1
+        while s in used:
+            i += 1; s = f"{base[:27]}_{i}"
+        used.add(s); return s
+    with pd.ExcelWriter(buf, engine='openpyxl') as w:
+        rows = []
+        for nm, d in hub.items():
+            rows.append({'Portfolio': nm, **{labels[i]: d['monthly'][i] for i in range(len(months))}})
+        rows.append({'Portfolio': 'CDI', **{labels[i]: cdi_m[i] for i in range(len(months))}})
+        _write_sheet(w, pd.DataFrame(rows), _uniq('Monthly Nominal'), labels)
+        rows = []
+        for nm, d in hub.items():
+            rows.append({'Portfolio': nm, **{labels[i]: pct_cdi(d['monthly'][i], cdi_m[i]) for i in range(len(months))}})
+        _write_sheet(w, pd.DataFrame(rows), _uniq('Monthly pctCDI'), [])
+        per = ['MTD', '3M', '6M', 'YTD', '12M']; rows = []
+        for nm, d in hub.items():
+            r = {'Portfolio': nm}
+            for p in per:
+                pv, cv = d['cum'][p]; r[p] = pv; r[p + ' %CDI'] = pct_cdi(pv, cv)
+            rows.append(r)
+        r = {'Portfolio': 'CDI'}
+        for p in per:
+            _, cv = list(hub.values())[0]['cum'][p]; r[p] = cv; r[p + ' %CDI'] = '-'
+        rows.append(r)
+        _write_sheet(w, pd.DataFrame(rows), _uniq('Cumulative'), per)
+        for nm, d in hub.items():
+            for level, key in [('Cat', 'cat_contrib'), ('Sub', 'sub_contrib')]:
+                contrib = d[key]; rows = []
+                for g, series in sorted(contrib.items(), key=lambda kv: -sum(kv[1])):
+                    rows.append({'Book': g, **{labels[i]: series[i] for i in range(len(months))}, 'Total': _cum(series)})
+                rows.append({'Book': 'PORTFOLIO', **{labels[i]: d['monthly'][i] for i in range(len(months))}, 'Total': _cum(d['monthly'])})
+                _write_sheet(w, pd.DataFrame(rows), _uniq(f'{level} {nm}'), labels + ['Total'])
+    buf.seek(0)
+    return buf.getvalue()
 
 
 def create_portfolio_template():
@@ -10696,7 +10843,7 @@ def main():
             if 'temp_portfolio' not in st.session_state:
                 st.session_state['temp_portfolio'] = {}
             
-            rec_tab1, rec_tab2, rec_tab3 = st.tabs(["📊 Portfolio Analysis", "📈 Investment Fund Analysis", "📚 Book Analysis"])
+            rec_tab1, rec_tab2, rec_tab3, rec_tab4 = st.tabs(["📊 Portfolio Analysis", "📈 Investment Fund Analysis", "📚 Book Analysis", "🏦 Consolidated"])
             
             # ═══════════════════════════════════════════════════════════════════════════
             # SECONDARY TAB 1: PORTFOLIO ANALYSIS
@@ -12231,6 +12378,156 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
                             st.markdown(style_book_analysis_table(monthly_book_df, month_labels), unsafe_allow_html=True)
                     else:
                         st.error("❌ CDI benchmark data not available or no fund returns")
+
+            with rec_tab4:
+                st.markdown("### 🏦 Consolidated Portfolio Hub")
+                st.markdown("Compare saved portfolios side by side vs CDI — monthly performance, category / sub-category (book) attribution, and full Excel export.")
+                st.markdown("---")
+
+                hub_user = st.session_state.get('username', 'default')
+                saved_list = list_portfolios_from_supabase(hub_user)
+                if not saved_list:
+                    st.info("No saved portfolios found in Supabase. Save portfolios first in 'Portfolio Analysis'.")
+                elif 'CDI' not in benchmarks.columns:
+                    st.error("CDI benchmark data not available.")
+                else:
+                    opt_map = {}
+                    for _p in saved_list:
+                        _nm = _p.get('portfolio_name'); _usr = _p.get('user_id', '')
+                        _label = f"{_nm}  ·  {_usr}" if _usr else str(_nm)
+                        while _label in opt_map:
+                            _label += " "
+                        opt_map[_label] = (_nm, _usr)
+
+                    sel_labels = st.multiselect("Select portfolios to consolidate:", list(opt_map.keys()), key="hub_select")
+                    n_months = st.slider("Months of history:", 6, 24, 12, key="hub_months")
+
+                    if not sel_labels:
+                        st.info("Select one or more portfolios above to build the consolidated view.")
+                    else:
+                        cdi_daily = benchmarks['CDI']
+                        hub = {}
+                        all_frd = {}
+                        with st.spinner("Loading portfolios and fund returns..."):
+                            for _label in sel_labels:
+                                _nm, _usr = opt_map[_label]
+                                holdings = load_portfolio_from_supabase(_nm, _usr)
+                                if not holdings:
+                                    continue
+                                frd = {fn: get_fund_returns_by_name(fn, fund_metrics, fund_details) for fn in holdings.keys()}
+                                frd = {k: v for k, v in frd.items() if v is not None}
+                                if not frd:
+                                    continue
+                                _tot = sum(holdings.values())
+                                weights = {k: (v / _tot) for k, v in holdings.items() if k in frd}
+                                _wsum = sum(weights.values())
+                                if _wsum > 0:
+                                    weights = {k: v / _wsum for k, v in weights.items()}
+                                cat_map, sub_map = {}, {}
+                                for fn in weights:
+                                    _row = fund_metrics[fund_metrics['FUNDO DE INVESTIMENTO'] == fn]
+                                    cat_map[fn] = _row['CATEGORIA BTG'].iloc[0] if (len(_row) > 0 and 'CATEGORIA BTG' in _row.columns) else 'Unknown'
+                                    sub_map[fn] = _row['SUBCATEGORIA BTG'].iloc[0] if (len(_row) > 0 and 'SUBCATEGORIA BTG' in _row.columns) else 'Unknown'
+                                # keep display name unique if two portfolios share a name
+                                _dname = _nm
+                                while _dname in hub:
+                                    _dname += " "
+                                hub[_dname] = {'weights': weights, 'frd': frd, 'cat_map': cat_map, 'sub_map': sub_map}
+                                all_frd.update(frd)
+
+                        if not hub:
+                            st.warning("No usable return data for the selected portfolios.")
+                        else:
+                            months, labels = hub_month_grid(all_frd, n_months)
+                            if not months:
+                                st.warning("Not enough data to build the monthly grid.")
+                            else:
+                                cdi_m = cdi_monthly_series(cdi_daily, months)
+                                for _nm, d in hub.items():
+                                    d['monthly'] = portfolio_monthly_series(d['frd'], d['weights'], months)
+                                    d['cat_contrib'] = group_contributions(d['frd'], d['weights'], d['cat_map'], months)
+                                    d['sub_contrib'] = group_contributions(d['frd'], d['weights'], d['sub_map'], months)
+                                    d['cum'] = cumulative_periods(d['monthly'], cdi_m, months)
+
+                                def _disp_pctcdi(v):
+                                    return v if isinstance(v, str) else f"{v:.0f}%"
+
+                                # ── Monthly performance ──
+                                st.markdown(f"#### 📅 Monthly Performance — last {len(months)} months")
+                                mview = st.radio("Show:", ["Nominal returns", "% of CDI"], horizontal=True, key="hub_monthly_view")
+                                mrows = []
+                                for _nm, d in hub.items():
+                                    if mview == "Nominal returns":
+                                        mrows.append({'Portfolio': _nm, **{labels[i]: d['monthly'][i] for i in range(len(months))}})
+                                    else:
+                                        mrows.append({'Portfolio': _nm, **{labels[i]: _disp_pctcdi(pct_cdi(d['monthly'][i], cdi_m[i])) for i in range(len(months))}})
+                                if mview == "Nominal returns":
+                                    mrows.append({'Portfolio': 'CDI', **{labels[i]: cdi_m[i] for i in range(len(months))}})
+                                    mdf = pd.DataFrame(mrows)
+                                    st.dataframe(mdf.style.format({c: '{:.2%}' for c in labels}), use_container_width=True, hide_index=True)
+                                else:
+                                    st.dataframe(pd.DataFrame(mrows), use_container_width=True, hide_index=True)
+
+                                figc = go.Figure()
+                                _pal = px.colors.qualitative.Bold
+                                for i, (_nm, d) in enumerate(hub.items()):
+                                    _cum_ser = np.cumprod([1 + x for x in d['monthly']]) - 1
+                                    figc.add_trace(go.Scatter(x=labels, y=[v * 100 for v in _cum_ser], name=_nm,
+                                                              mode='lines+markers', line=dict(color=_pal[i % len(_pal)], width=2)))
+                                _cdi_cum = np.cumprod([1 + x for x in cdi_m]) - 1
+                                figc.add_trace(go.Scatter(x=labels, y=[v * 100 for v in _cdi_cum], name='CDI',
+                                                          line=dict(color='#00CED1', width=2, dash='dash')))
+                                figc.update_layout(title="Cumulative performance vs CDI", yaxis_title="Cumulative %",
+                                                   height=400, template="plotly_dark", hovermode='x unified')
+                                st.plotly_chart(figc, use_container_width=True)
+
+                                # ── Cumulative period table ──
+                                st.markdown("#### 📈 Cumulative Performance — nominal & % of CDI")
+                                _per = ['MTD', '3M', '6M', 'YTD', '12M']
+                                crows = []
+                                for _nm, d in hub.items():
+                                    _r = {'Portfolio': _nm}
+                                    for p in _per:
+                                        pv, cv = d['cum'][p]
+                                        _r[p] = pv
+                                        _r[p + ' (%CDI)'] = _disp_pctcdi(pct_cdi(pv, cv))
+                                    crows.append(_r)
+                                _cdi_r = {'Portfolio': 'CDI'}
+                                for p in _per:
+                                    _, cv = list(hub.values())[0]['cum'][p]
+                                    _cdi_r[p] = cv; _cdi_r[p + ' (%CDI)'] = '—'
+                                crows.append(_cdi_r)
+                                cdf = pd.DataFrame(crows)
+                                st.dataframe(cdf.style.format({c: '{:.2%}' for c in _per}), use_container_width=True, hide_index=True)
+
+                                # ── Book attribution ──
+                                st.markdown("#### 🧩 Book Attribution — monthly weighted contribution")
+                                st.markdown("<p style='color:#888;font-size:12px;'>Each book's weighted contribution to the portfolio's monthly return. Books sum to the portfolio row.</p>", unsafe_allow_html=True)
+                                attr_level = st.radio("Group by:", ["Category", "Sub-category"], horizontal=True, key="hub_attr_level")
+                                for _nm, d in hub.items():
+                                    with st.expander(f"📚 {_nm}", expanded=(len(hub) == 1)):
+                                        contrib = d['cat_contrib'] if attr_level == "Category" else d['sub_contrib']
+                                        arows = []
+                                        for g, series in sorted(contrib.items(), key=lambda kv: -_cum(kv[1])):
+                                            arows.append({attr_level: g, **{labels[i]: series[i] for i in range(len(months))}, 'Total': _cum(series)})
+                                        arows.append({attr_level: 'PORTFOLIO', **{labels[i]: d['monthly'][i] for i in range(len(months))}, 'Total': _cum(d['monthly'])})
+                                        adf = pd.DataFrame(arows)
+                                        st.dataframe(adf.style.format({c: '{:.2%}' for c in (labels + ['Total'])}), use_container_width=True, hide_index=True)
+                                        _tot = {g: _cum(s) for g, s in contrib.items()}
+                                        if _tot:
+                                            _best = max(_tot, key=_tot.get); _worst = min(_tot, key=_tot.get)
+                                            st.caption(f"🏅 Top book: **{_best}** ({_tot[_best]*100:.2f}%)   •   🔻 Weakest: **{_worst}** ({_tot[_worst]*100:.2f}%)")
+
+                                # ── Export ──
+                                st.markdown("---")
+                                if st.button("📤 Build consolidated Excel (.xlsx)", key="hub_export_btn"):
+                                    st.session_state['hub_xlsx'] = build_hub_xlsx(hub, cdi_m, months, labels)
+                                if st.session_state.get('hub_xlsx'):
+                                    st.download_button("⬇️  Download consolidated report (.xlsx)",
+                                        data=st.session_state['hub_xlsx'],
+                                        file_name=f"consolidated_portfolios_{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx",
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        key="hub_export_dl")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # TAB 6: RISK MONITOR
