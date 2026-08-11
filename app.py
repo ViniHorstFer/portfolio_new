@@ -10729,24 +10729,44 @@ def main():
                         if uploaded:
                             try:
                                 pdf = pd.read_excel(uploaded)
-                                if 'Fund Name' in pdf.columns and 'Allocation (%)' in pdf.columns:
+                                st.markdown("**Loaded file preview:**")
+                                st.dataframe(pdf, use_container_width=True, hide_index=True)
+                                if 'Fund Name' not in pdf.columns or 'Allocation (%)' not in pdf.columns:
+                                    st.error(
+                                        "The file must contain the columns **'Fund Name'** and **'Allocation (%)'**. "
+                                        f"Columns found: {', '.join(map(str, pdf.columns))}. "
+                                        "Download the template above and fill it in."
+                                    )
+                                else:
+                                    # Match fund names to the database, tolerant of case / extra spaces
                                     avail = fund_metrics['FUNDO DE INVESTIMENTO'].tolist()
+                                    def _norm(x):
+                                        return ' '.join(str(x).strip().upper().split())
+                                    _lookup = {_norm(a): a for a in avail}
                                     valid, invalid = {}, []
                                     for _, r in pdf.iterrows():
-                                        if r['Fund Name'] in avail:
-                                            valid[r['Fund Name']] = r['Allocation (%)']
+                                        _match = _lookup.get(_norm(r['Fund Name']))
+                                        if _match is not None:
+                                            valid[_match] = r['Allocation (%)']
                                         else:
-                                            invalid.append(r['Fund Name'])
+                                            invalid.append(str(r['Fund Name']))
                                     if invalid:
-                                        st.warning(f"Not found: {', '.join(invalid)}")
+                                        st.warning(f"⚠️ {len(invalid)} fund(s) not found in the database: {', '.join(invalid)}")
                                     if valid:
-                                        st.success(f"✅ {len(valid)} valid funds")
-                                        if st.button("💾 Save Portfolio", key="save_up"):
+                                        st.success(f"✅ {len(valid)} valid fund(s) ready to add")
+                                        st.dataframe(
+                                            pd.DataFrame({'Fund Name': list(valid.keys()), 'Allocation (%)': list(valid.values())}),
+                                            use_container_width=True, hide_index=True
+                                        )
+                                        if st.button("➕ Add / Save Portfolio", key="save_up", use_container_width=True):
                                             st.session_state['recommended_portfolio'] = valid
                                             st.session_state['recommended_portfolio_saved'] = True
+                                            st.session_state['temp_portfolio'] = dict(valid)
                                             st.rerun()
+                                    else:
+                                        st.info("No valid funds yet — adjust the fund names above so they match the database, then re-upload.")
                             except Exception as e:
-                                st.error(f"Error: {e}")
+                                st.error(f"Error reading the file: {e}")
                     else:
                         st.markdown("---")
                         avail = fund_metrics['FUNDO DE INVESTIMENTO'].tolist()
@@ -10757,7 +10777,7 @@ def main():
                             alloc = st.number_input("Alloc (%)", 0.1, 100.0, 10.0, 0.5, key="rec_alloc")
                         with c3:
                             st.markdown("<br>", unsafe_allow_html=True)
-                            if st.button("➕ Add"):
+                            if st.button("➕ Add", key="rec_add", use_container_width=True):
                                 st.session_state['temp_portfolio'][sel] = alloc
                                 st.rerun()
                         
