@@ -422,7 +422,7 @@ USER_ROLES = {
     "manager":    {"can_upload": True,  "tabs": "all", "sidebar": True,  "can_manage_portfolios": True},
     "banker":     {"can_upload": False, "tabs": ["📋 FUND DATABASE", "📊 DETAILED ANALYSIS", "💼 RECOMMENDED PORTFOLIO"], "sidebar": True,  "can_manage_portfolios": True},
     "trader":     {"can_upload": False, "tabs": "all", "sidebar": True,  "can_manage_portfolios": True},
-    "guilherme":  {"can_upload": False, "tabs": ["📋 FUND DATABASE", "📊 DETAILED ANALYSIS", "💼 RECOMMENDED PORTFOLIO"], "sidebar": False, "can_manage_portfolios": False},
+    "guilherme":  {"can_upload": False, "tabs": ["📋 FUND DATABASE", "📊 DETAILED ANALYSIS", "💼 RECOMMENDED PORTFOLIO"], "sidebar": True, "can_manage_portfolios": False, "etf_tabs": ["📋 ETF DATABASE", "📊 DETAILED ANALYSIS", "💼 RECOMMENDED PORTFOLIO"]},
 }
 
 def get_user_permissions(username: str) -> dict:
@@ -3553,17 +3553,16 @@ def run_etf_system():
         return
     
     # Create tabs
-    tabs = st.tabs([
-        "📋 ETF DATABASE",
-        "📊 DETAILED ANALYSIS",
-        "⚖️ ADVANCED COMPARISON",
-        "🎯 PORTFOLIO CONSTRUCTION",
-        "💼 RECOMMENDED PORTFOLIO",
-        "🚨 RISK MONITOR"
-    ])
+    ETF_ALL_TABS = ["📋 ETF DATABASE", "📊 DETAILED ANALYSIS", "⚖️ ADVANCED COMPARISON", "🎯 PORTFOLIO CONSTRUCTION", "💼 RECOMMENDED PORTFOLIO", "🚨 RISK MONITOR"]
+    _etf_user = st.session_state.get('username', 'admin')
+    _etf_allow = USER_ROLES.get(_etf_user, {}).get("etf_tabs", "all")
+    _etf_available = ETF_ALL_TABS if _etf_allow == "all" else [t for t in ETF_ALL_TABS if t in _etf_allow]
+    _etf_tab_objs = st.tabs(_etf_available)
+    etf_tab_map = {name: t for name, t in zip(_etf_available, _etf_tab_objs)}
     
     # Securities Database
-    with tabs[0]:
+    if "📋 ETF DATABASE" in etf_tab_map:
+      with etf_tab_map["📋 ETF DATABASE"]:
         st.title("📋 ETF DATABASE")
         st.markdown("---")
         cols = ['Name', 'Class', 'Category']
@@ -3575,7 +3574,8 @@ def run_etf_system():
     # TAB 2: DETAILED ANALYSIS
     # ═══════════════════════════════════════════════════════════════
     
-    with tabs[1]:
+    if "📊 DETAILED ANALYSIS" in etf_tab_map:
+      with etf_tab_map["📊 DETAILED ANALYSIS"]:
         st.title("📊 DETAILED ETF ANALYSIS")
         st.markdown("---")
         
@@ -4279,7 +4279,8 @@ def run_etf_system():
             st.markdown("---")
         
     
-    with tabs[2]:
+    if "⚖️ ADVANCED COMPARISON" in etf_tab_map:
+      with etf_tab_map["⚖️ ADVANCED COMPARISON"]:
         st.title("⚖️ ADVANCED ETF COMPARISON")
         st.markdown("### Select metrics and filter ETFs for comparison")
         st.markdown("---")
@@ -4485,7 +4486,8 @@ def run_etf_system():
                 summary_stats = summary_stats[['mean', 'std', 'min', '25%', '50%', '75%', 'max']]
                 st.dataframe(summary_stats, use_container_width=True)
     
-    with tabs[3]:
+    if "🎯 PORTFOLIO CONSTRUCTION" in etf_tab_map:
+      with etf_tab_map["🎯 PORTFOLIO CONSTRUCTION"]:
         st.title("🎯 PORTFOLIO CONSTRUCTION")
         st.markdown("### Build an optimized Portfolio using Wasserstein Distributionally Robust Optimization (DRO)")
         st.markdown("---")
@@ -5565,7 +5567,8 @@ def run_etf_system():
                     import traceback
                     st.code(traceback.format_exc())
     
-    with tabs[4]:
+    if "💼 RECOMMENDED PORTFOLIO" in etf_tab_map:
+      with etf_tab_map["💼 RECOMMENDED PORTFOLIO"]:
         st.title("💼 RECOMMENDED ETF PORTFOLIO")
         st.markdown("### Create and analyze your recommended ETF portfolio")
         st.markdown("---")
@@ -5587,9 +5590,14 @@ def run_etf_system():
         with etf_rec_tab1:
             st.markdown("### 📊 Portfolio Analysis")
             st.markdown("---")
-            st.markdown("#### 📝 Create Your Portfolio")
-            
-            creation_method = st.radio("Choose method:", ["📤 Upload Excel File", "🔍 Search and Select ETFs"], horizontal=True, key="etf_rec_method")
+            current_user = st.session_state.get('username', 'default')
+            _etf_can_manage = can_user_manage_portfolios(current_user)
+            if _etf_can_manage:
+                st.markdown("#### 📝 Create Your Portfolio")
+                creation_method = st.radio("Choose method:", ["📤 Upload Excel File", "🔍 Search and Select ETFs"], horizontal=True, key="etf_rec_method")
+            else:
+                creation_method = None
+                st.info("🔒 Creating or editing portfolios is not available for your account. Load a saved portfolio from the Cloud Portfolio Storage section below.")
             
             if creation_method == "📤 Upload Excel File":
                 st.markdown("---")
@@ -5630,7 +5638,7 @@ def run_etf_system():
                                     st.rerun()
                     except Exception as e:
                         st.error(f"Error: {e}")
-            else:
+            elif creation_method == "🔍 Search and Select ETFs":
                 st.markdown("---")
                 avail = metrics_df.index.tolist()
                 c1, c2, c3 = st.columns([3, 1, 1])
@@ -7204,7 +7212,8 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                 else:
                     st.error("❌ Benchmark data not available or no ETF returns")
     
-    with tabs[5]:
+    if "🚨 RISK MONITOR" in etf_tab_map:
+      with etf_tab_map["🚨 RISK MONITOR"]:
         st.title("🚨 ETF RISK MONITOR")
         st.markdown("### Real-time monitoring of ETF returns vs VaR thresholds")
         st.markdown("---")
@@ -7875,7 +7884,8 @@ def main():
             st.markdown("---")
             st.header("⚙️ System Selection")
             
-            etf_allowed = USER_ROLES.get(current_username, {}).get("tabs") == "all"
+            _role_perms = USER_ROLES.get(current_username, {})
+            etf_allowed = (_role_perms.get("tabs") == "all") or bool(_role_perms.get("etf_tabs"))
             if etf_allowed:
                 system_type = st.radio(
                     "Select System:",
