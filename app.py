@@ -5794,17 +5794,25 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                 portfolio_returns = None
                 valid_etfs = []
                 
+                etf_ret_map = {}
                 for ticker, weight in portfolio.items():
                     if ticker in prices_df.columns:
                         etf_prices = prices_df[ticker].dropna()
                         etf_rets = etf_prices.pct_change().dropna()
-                        
-                        if portfolio_returns is None:
-                            portfolio_returns = etf_rets * (weight / 100)
-                        else:
-                            common_idx = portfolio_returns.index.intersection(etf_rets.index)
-                            portfolio_returns = portfolio_returns.reindex(common_idx).fillna(0) + etf_rets.reindex(common_idx).fillna(0) * (weight / 100)
-                        valid_etfs.append(ticker)
+                        if len(etf_rets) > 0:
+                            etf_ret_map[ticker] = etf_rets
+                            valid_etfs.append(ticker)
+                if etf_ret_map:
+                    # Union of dates, weights renormalized each day across the ETFs that have
+                    # data — so a single short/truncated ticker no longer collapses the series.
+                    ret_df = pd.DataFrame(etf_ret_map)
+                    _wn = pd.Series({t: float(portfolio[t]) for t in etf_ret_map})
+                    _wn = _wn / _wn.sum()
+                    _mask = ret_df.notna()
+                    _eff = _mask.mul(_wn, axis=1)
+                    _row_w = _eff.sum(axis=1)
+                    portfolio_returns = (ret_df.fillna(0) * _eff).sum(axis=1) / _row_w.replace(0, np.nan)
+                    portfolio_returns = portfolio_returns.dropna()
                 
                 if portfolio_returns is not None and len(portfolio_returns) > 0:
                     # Period selection
@@ -5908,18 +5916,46 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                             hide_index=True
                         )
                     
-                    # ETF Allocation Table
+                    # ETF Allocation Table (with loaded data coverage per asset)
                     st.markdown("#### ETF Allocation")
-                    etf_alloc_df = pd.DataFrame({
-                        'ETF': list(weights_series.index),
-                        'Weight %': [w*100 for w in weights_series.values]
-                    }).sort_values('Weight %', ascending=False)
-                    
+                    _alloc_rows = []
+                    for _t in weights_series.index:
+                        _first = _last = None
+                        _nobs = 0
+                        if _t in prices_df.columns:
+                            _s = prices_df[_t].dropna()
+                            _nobs = int(len(_s))
+                            if _nobs > 0:
+                                _first = _s.index.min()
+                                _last = _s.index.max()
+                        _alloc_rows.append({
+                            'ETF': _t,
+                            'Weight %': float(weights_series[_t]) * 100,
+                            'First Date': _first.strftime('%Y-%m-%d') if _first is not None else 'N/A',
+                            'Last Date': _last.strftime('%Y-%m-%d') if _last is not None else 'N/A',
+                            'Obs': _nobs,
+                        })
+                    etf_alloc_df = pd.DataFrame(_alloc_rows).sort_values('Weight %', ascending=False)
                     st.dataframe(
                         etf_alloc_df.style.format({'Weight %': '{:.2f}%'}),
                         use_container_width=True,
                         hide_index=True
                     )
+                    # Flag assets whose loaded history starts much later than the rest —
+                    # these are the likely cause of a truncated / short portfolio series.
+                    try:
+                        _firsts = [(r['ETF'], pd.to_datetime(r['First Date'])) for r in _alloc_rows if r['First Date'] != 'N/A']
+                        if len(_firsts) >= 2:
+                            _med_first = pd.Series([d for _, d in _firsts]).median()
+                            _short = [e for e, d in _firsts if d > _med_first + pd.Timedelta(days=180)]
+                            _missing = [r['ETF'] for r in _alloc_rows if r['First Date'] == 'N/A']
+                            if _short:
+                                st.warning("⚠️ Much shorter loaded history than the rest (these limit the common date range and are the likely cause of a cut-off): "
+                                           + ", ".join(_short) + ". Verify these tickers in GitHub Releases / re-run the pipeline for them.")
+                            if _missing:
+                                st.warning("⚠️ No price data loaded for: " + ", ".join(_missing) + ".")
+                    except Exception:
+                        pass
                     
                     st.markdown("---")
                     
