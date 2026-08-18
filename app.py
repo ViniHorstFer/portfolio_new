@@ -196,7 +196,7 @@ def load_portfolio_from_supabase(portfolio_name: str, user_id: str = "default") 
         return None
 
 
-def list_portfolios_from_supabase(user_id: str = "default") -> list:
+def list_portfolios_from_supabase(user_id: str = "default", include_rebalanced: bool = False) -> list:
     """List all saved portfolios from Supabase - shared across all users."""
     client = get_supabase_client()
     if not client:
@@ -209,7 +209,10 @@ def list_portfolios_from_supabase(user_id: str = "default") -> list:
             "updated_at", desc=True
         ).execute()
         
-        return result.data if result.data else []
+        data = result.data if result.data else []
+        if not include_rebalanced:
+            data = [p for p in data if not str(p.get('portfolio_name', '')).startswith(REB_PREFIX)]
+        return data
     except Exception as e:
         st.error(f"Failed to list portfolios: {e}")
         return []
@@ -2402,6 +2405,431 @@ def build_portfolio_report_xlsx(df, period_cols, title, sheet_name='Report'):
     _buf.seek(0)
     return _buf.getvalue()
 
+
+
+
+REB_PREFIX = "__RB__"
+
+def build_rebalanced_template_xlsx(asset_label="Asset", example_assets=None):
+    ex = example_assets or ["ASSET_A", "ASSET_B", "ASSET_C"]
+    rows = [
+        {f"{asset_label} Name": ex[0], "Weight (%)": 50, "Rebalance Date": "2024-06-30"},
+        {f"{asset_label} Name": ex[1], "Weight (%)": 50, "Rebalance Date": "2024-06-30"},
+        {f"{asset_label} Name": ex[0], "Weight (%)": 40, "Rebalance Date": "2025-06-30"},
+        {f"{asset_label} Name": ex[1], "Weight (%)": 30, "Rebalance Date": "2025-06-30"},
+        {f"{asset_label} Name": ex[2] if len(ex) > 2 else ex[0], "Weight (%)": 30, "Rebalance Date": "2025-06-30"},
+        {f"{asset_label} Name": ex[0], "Weight (%)": 34, "Rebalance Date": ""},
+        {f"{asset_label} Name": ex[1], "Weight (%)": 33, "Rebalance Date": ""},
+        {f"{asset_label} Name": ex[2] if len(ex) > 2 else ex[0], "Weight (%)": 33, "Rebalance Date": ""},
+    ]
+    df = pd.DataFrame(rows, columns=[f"{asset_label} Name", "Weight (%)", "Rebalance Date"])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as w:
+        df.to_excel(w, index=False, sheet_name="Rebalanced")
+        ws = w.sheets["Rebalanced"]
+        from openpyxl.styles import Font, PatternFill
+        for c in range(1, 4):
+            cell = ws.cell(row=1, column=c); cell.font = Font(bold=True); cell.fill = PatternFill('solid', fgColor='FFD700')
+        ws.column_dimensions['A'].width = 28; ws.column_dimensions['B'].width = 12; ws.column_dimensions['C'].width = 16
+        # instructions sheet
+        ins = w.book.create_sheet("Instructions")
+        notes = [
+            "How to fill this template:",
+            "1. One row per asset PER allocation period.",
+            "2. 'Rebalance Date' = the LAST day that allocation is in effect (YYYY-MM-DD).",
+            "3. All rows sharing the same Rebalance Date form one allocation.",
+            "4. Leave 'Rebalance Date' BLANK for the CURRENT (most recent) allocation.",
+            "5. Weights within each allocation should sum to 100.",
+            "6. The portfolio starts on the first date the newest asset of the first allocation has data.",
+        ]
+        for i, t in enumerate(notes, 1):
+            ins.cell(row=i, column=1, value=t)
+        ins.column_dimensions['A'].width = 90
+    buf.seek(0)
+    return buf.getvalue()
+
+def parse_rebalanced_template(df):
+    cols = {c.lower().strip(): c for c in df.columns}
+    def find(*keys):
+        for k in keys:
+            for lc, orig in cols.items():
+                if k in lc:
+                    return orig
+        return None
+    name_col = find('name', 'ticker', 'fund', 'asset', 'etf')
+    weight_col = find('weight', 'alloc')
+    date_col = find('rebalance', 'date')
+    if name_col is None or weight_col is None or date_col is None:
+        return None, f"Missing required columns. Found: {list(df.columns)}. Need asset name, weight, rebalance date."
+    groups = {}
+    errors = []
+    for _, r in df.iterrows():
+        nm = r[name_col]
+        if pd.isna(nm) or str(nm).strip() == '':
+            continue
+        try:
+            wt = float(r[weight_col])
+        except Exception:
+            errors.append(f"Bad weight for {nm}"); continue
+        rd = r[date_col]
+        if pd.isna(rd) or str(rd).strip() == '':
+            key = None
+        else:
+            try:
+                key = pd.to_datetime(rd).normalize()
+            except Exception:
+                errors.append(f"Bad rebalance date '{rd}' for {nm}"); continue
+        groups.setdefault(key, {})
+        groups[key][str(nm).strip()] = groups[key].get(str(nm).strip(), 0.0) + wt
+    if not groups:
+        return None, "No valid rows found."
+    dated = sorted([k for k in groups if k is not None])
+    order = dated + ([None] if None in groups else [])
+    allocations = [{'rebalance_date': (k.isoformat() if k is not None else None), 'weights': groups[k]} for k in order]
+    return allocations, (("; ".join(errors)) if errors else None)
+
+def _norm_alloc(allocations):
+    out = []
+    for a in allocations:
+        rd = a['rebalance_date']
+        rd = pd.to_datetime(rd).normalize() if rd else None
+        out.append({'rebalance_date': rd, 'weights': dict(a['weights'])})
+    dated = sorted([a for a in out if a['rebalance_date'] is not None], key=lambda x: x['rebalance_date'])
+    current = [a for a in out if a['rebalance_date'] is None]
+    return dated + current
+
+def _seg_weighted_returns(weights, asset_ret_fn, cache, lo, hi, include_lo):
+    cols = {}
+    for a, w in weights.items():
+        if a not in cache:
+            cache[a] = asset_ret_fn(a)
+        r = cache[a]
+        if r is None or len(r) == 0:
+            continue
+        if include_lo:
+            seg = r[(r.index >= lo) & (r.index <= hi)]
+        else:
+            seg = r[(r.index > lo) & (r.index <= hi)]
+        if len(seg) > 0:
+            cols[a] = seg
+    if not cols:
+        return None
+    ret_df = pd.DataFrame(cols)
+    wn = pd.Series({a: float(weights[a]) for a in cols}); wn = wn / wn.sum()
+    mask = ret_df.notna(); eff = mask.mul(wn, axis=1); row_w = eff.sum(axis=1)
+    port = (ret_df.fillna(0) * eff).sum(axis=1) / row_w.replace(0, np.nan)
+    return port.dropna()
+
+def rebalanced_daily_returns(allocations, asset_ret_fn):
+    allocations = _norm_alloc(allocations)
+    cache = {}
+    # portfolio start = newest asset (max first-return-date) among FIRST allocation
+    firsts = []
+    for a in allocations[0]['weights']:
+        if a not in cache:
+            cache[a] = asset_ret_fn(a)
+        r = cache[a]
+        if r is not None and len(r) > 0:
+            firsts.append(r.index.min())
+    if not firsts:
+        return None, [], None, cache
+    start = max(firsts)
+    # global last date across all assets used
+    last = None
+    for a_i, alloc in enumerate(allocations):
+        for a in alloc['weights']:
+            if a not in cache:
+                cache[a] = asset_ret_fn(a)
+            r = cache[a]
+            if r is not None and len(r) > 0:
+                last = r.index.max() if last is None else max(last, r.index.max())
+    rdates = [a['rebalance_date'] for a in allocations]  # last is None
+    segments = []
+    reb_points = []
+    prev = start
+    for i, alloc in enumerate(allocations):
+        hi = rdates[i] if rdates[i] is not None else last
+        include_lo = (i == 0)
+        seg = _seg_weighted_returns(alloc['weights'], asset_ret_fn, cache, prev, hi, include_lo)
+        if seg is not None and len(seg) > 0:
+            segments.append(seg)
+        if rdates[i] is not None:
+            reb_points.append(rdates[i])
+        prev = hi
+    if not segments:
+        return None, [], start, cache
+    daily = pd.concat(segments).sort_index()
+    daily = daily[~daily.index.duplicated(keep='last')]
+    return daily, reb_points, start, cache
+
+def active_alloc_weights(allocations, on_date):
+    allocations = _norm_alloc(allocations)
+    on_date = pd.to_datetime(on_date).normalize()
+    for a in allocations:
+        rd = a['rebalance_date']
+        if rd is None or on_date <= rd:
+            return a['weights']
+    return allocations[-1]['weights']
+
+def _months_from_daily(daily, n=12):
+    m = daily.resample('ME').last().dropna().tail(n)
+    return list(m.index), [d.strftime('%b-%y') for d in m.index]
+
+def rebalanced_group_contributions(allocations, asset_ret_fn, cache, group_of, months):
+    result = {}
+    port = [0.0] * len(months)
+    for mi, me in enumerate(months):
+        w = active_alloc_weights(allocations, me)
+        tot = sum(w.values())
+        if tot <= 0:
+            continue
+        ms = me.replace(day=1)
+        for a, wa in w.items():
+            if a not in cache:
+                cache[a] = asset_ret_fn(a)
+            r = cache[a]
+            if r is None or len(r) == 0:
+                continue
+            seg = r[(r.index >= ms) & (r.index <= me)]
+            rm = float((1 + seg).prod() - 1) if len(seg) > 0 else 0.0
+            c = (wa / tot) * rm
+            g = group_of(a)
+            if g not in result:
+                result[g] = [0.0] * len(months)
+            result[g][mi] += c
+            port[mi] += c
+    return result, port
+
+# ── Supabase persistence for rebalanced portfolios (reuses the existing table via a reserved prefix) ──
+def _reb_key(name, system):
+    return f"{REB_PREFIX}{system}:{name}"
+
+def save_rebalanced_to_supabase(name, allocations, user, system):
+    return save_portfolio_to_supabase(_reb_key(name, system),
+                                      {'__rebalanced__': True, 'system': system, 'allocations': allocations}, user)
+
+def list_rebalanced_from_supabase(user, system):
+    pre = f"{REB_PREFIX}{system}:"
+    out = []
+    for p in list_portfolios_from_supabase(user, include_rebalanced=True):
+        nm = str(p.get('portfolio_name', ''))
+        if nm.startswith(pre):
+            out.append(nm[len(pre):])
+    return sorted(set(out))
+
+def load_rebalanced_from_supabase(name, user, system):
+    d = load_portfolio_from_supabase(_reb_key(name, system), user)
+    if isinstance(d, dict) and d.get('__rebalanced__'):
+        return d.get('allocations')
+    return None
+
+def delete_rebalanced_from_supabase(name, user, system):
+    return delete_portfolio_from_supabase(_reb_key(name, system), user)
+
+def build_rebalanced_xlsx(name, allocations, months, labels, port_m, cdi_m, cp):
+    import io as _io
+    buf = _io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as w:
+        rows = [{'Series': name, **{labels[i]: port_m[i] for i in range(len(months))}},
+                {'Series': 'CDI', **{labels[i]: cdi_m[i] for i in range(len(months))}}]
+        _write_sheet(w, pd.DataFrame(rows), 'Monthly', labels)
+        per = ['MTD', '3M', '6M', 'YTD', '12M']
+        crows = [{'Period': p, 'Portfolio': cp[p][0], 'CDI': cp[p][1],
+                  '% CDI': (pct_cdi(cp[p][0], cp[p][1]))} for p in per]
+        _write_sheet(w, pd.DataFrame(crows), 'Cumulative', ['Portfolio', 'CDI'])
+        arows = []
+        for i, a in enumerate(_norm_alloc(allocations)):
+            rd = a['rebalance_date']
+            tag = (rd.date().isoformat() if rd is not None else 'current')
+            for asset, wt in a['weights'].items():
+                arows.append({'Allocation': i + 1, 'Effective until': tag, 'Asset': asset, 'Weight %': wt})
+        _write_sheet(w, pd.DataFrame(arows), 'Allocation history', [])
+    buf.seek(0)
+    return buf.getvalue()
+
+def render_rebalanced_portfolio_tab(ctx):
+    label = ctx['asset_label']
+    state_key = ctx['state_key']
+    user = ctx['user']
+    can_manage = ctx['can_manage']
+    system = ctx['system']
+    cdi_daily = ctx.get('cdi_daily')
+    XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    st.markdown("### 🔁 Rebalanced Portfolio")
+    st.markdown("Build a portfolio whose allocation changes over time, via an Excel template. "
+                "Each allocation's **Rebalance Date** is its last day in effect; leave it blank for the current allocation.")
+
+    ex = [str(u) for u in list(ctx['universe'])[:3]] if len(ctx['universe']) else ["ASSET_A", "ASSET_B", "ASSET_C"]
+    st.download_button("⬇️ Download template (.xlsx)", data=build_rebalanced_template_xlsx(label, ex),
+                       file_name="rebalanced_template.xlsx", mime=XLSX_MIME, key=f"reb_tpl_{state_key}")
+
+    if can_manage:
+        up = st.file_uploader("Upload filled template", type=['xlsx'], key=f"reb_up_{state_key}")
+        if up:
+            try:
+                pdf = pd.read_excel(up)
+                st.markdown("**Loaded file preview:**")
+                st.dataframe(pdf, use_container_width=True, hide_index=True)
+                allocs, err = parse_rebalanced_template(pdf)
+                if allocs is None:
+                    st.error(err)
+                else:
+                    if err:
+                        st.warning(err)
+                    uni = {' '.join(str(u).strip().upper().split()): u for u in ctx['universe']}
+                    invalid = set()
+                    for a in allocs:
+                        nw = {}
+                        for nm, wt in a['weights'].items():
+                            k = ' '.join(str(nm).strip().upper().split())
+                            if k in uni:
+                                nw[uni[k]] = wt
+                            else:
+                                invalid.add(str(nm))
+                        a['weights'] = nw
+                    allocs = [a for a in allocs if a['weights']]
+                    if invalid:
+                        st.warning(f"⚠️ Not found in the database (ignored): {', '.join(sorted(invalid))}")
+                    if allocs:
+                        st.success(f"✅ Parsed {len(allocs)} allocation period(s).")
+                        _nm = st.text_input("Portfolio name:", key=f"reb_name_{state_key}")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if st.button("👁️ Load into view", key=f"reb_view_{state_key}", use_container_width=True):
+                                st.session_state[state_key] = {'name': (_nm or 'Rebalanced Portfolio'), 'allocations': allocs}
+                                st.rerun()
+                        with col2:
+                            if st.button("💾 Save to Supabase", key=f"reb_save_{state_key}", use_container_width=True):
+                                if not _nm:
+                                    st.warning("Enter a portfolio name first.")
+                                elif save_rebalanced_to_supabase(_nm, allocs, user, system):
+                                    st.session_state[state_key] = {'name': _nm, 'allocations': allocs}
+                                    st.success(f"Saved '{_nm}'.")
+                                    st.rerun()
+                    else:
+                        st.info("No valid assets to build a portfolio.")
+            except Exception as e:
+                st.error(f"Error reading the file: {e}")
+    else:
+        st.info("🔒 Creating rebalanced portfolios is not available for your account. Load a saved one below.")
+
+    with st.expander("☁️ Saved Rebalanced Portfolios (Supabase)", expanded=(st.session_state.get(state_key) is None)):
+        saved = list_rebalanced_from_supabase(user, system)
+        if saved:
+            _sel = st.selectbox("Saved rebalanced portfolios:", saved, key=f"reb_sel_{state_key}")
+            lc1, lc2 = st.columns(2)
+            with lc1:
+                if st.button("📥 Load", key=f"reb_load_{state_key}", use_container_width=True):
+                    a = load_rebalanced_from_supabase(_sel, user, system)
+                    if a:
+                        st.session_state[state_key] = {'name': _sel, 'allocations': a}
+                        st.rerun()
+                    else:
+                        st.error("Could not load this portfolio.")
+            with lc2:
+                if can_manage:
+                    if st.button("🗑️ Delete", key=f"reb_del_{state_key}", use_container_width=True):
+                        delete_rebalanced_from_supabase(_sel, user, system)
+                        if st.session_state.get(state_key, {}).get('name') == _sel:
+                            st.session_state.pop(state_key, None)
+                        st.rerun()
+        else:
+            st.caption("No saved rebalanced portfolios yet.")
+
+    active = st.session_state.get(state_key)
+    if not active:
+        return
+    st.markdown("---")
+    st.markdown(f"## {active['name']}")
+    allocs = active['allocations']
+    daily, reb_points, start, cache = rebalanced_daily_returns(allocs, ctx['asset_ret_fn'])
+    if daily is None or len(daily) == 0:
+        st.error("No return data could be computed — check the asset names and their data coverage.")
+        return
+    st.caption(f"Series from {daily.index.min().date()} to {daily.index.max().date()} · "
+               f"{len(reb_points)} rebalance(s) · start = newest asset of the first allocation.")
+
+    port_cum = (1 + daily).cumprod()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=port_cum.index, y=(port_cum - 1) * 100, name=active['name'],
+                             line=dict(color='#FFD700', width=2)))
+    if cdi_daily is not None:
+        _cs = cdi_daily[(cdi_daily.index >= daily.index.min()) & (cdi_daily.index <= daily.index.max())]
+        if len(_cs) > 0:
+            _cc = (1 + _cs).cumprod()
+            fig.add_trace(go.Scatter(x=_cc.index, y=(_cc - 1) * 100, name='CDI',
+                                     line=dict(color='#00CED1', width=2, dash='dash')))
+    for rp in reb_points:
+        _idx = port_cum.index[port_cum.index <= rp]
+        if len(_idx) > 0:
+            _y = (port_cum.loc[_idx.max()] - 1) * 100
+            fig.add_trace(go.Scatter(x=[_idx.max()], y=[_y], mode='markers',
+                                     marker=dict(color='#FF5252', size=11, symbol='diamond'),
+                                     name='Rebalance', showlegend=False,
+                                     hovertext=[f"Rebalance {rp.date()}"], hoverinfo='text'))
+    fig.update_layout(title="Cumulative performance vs CDI  (♦ = rebalance)", yaxis_title="Cumulative %",
+                      height=420, template="plotly_dark", hovermode='x unified')
+    st.plotly_chart(fig, use_container_width=True)
+
+    months, labels = _months_from_daily(daily, 12)
+    def _mret(s, me):
+        ms = me.replace(day=1)
+        seg = s[(s.index >= ms) & (s.index <= me)]
+        return float((1 + seg).prod() - 1) if len(seg) > 0 else 0.0
+    port_m = [_mret(daily, me) for me in months]
+    cdi_m = [(_mret(cdi_daily, me) if cdi_daily is not None else 0.0) for me in months]
+
+    st.markdown("#### 📅 Monthly returns vs CDI")
+    mrows = [{'Series': active['name'], **{labels[i]: port_m[i] for i in range(len(months))}},
+             {'Series': 'CDI', **{labels[i]: cdi_m[i] for i in range(len(months))}}]
+    st.dataframe(pd.DataFrame(mrows).style.format({l: '{:.2%}' for l in labels}),
+                 use_container_width=True, hide_index=True)
+
+    st.markdown("#### 📈 Cumulative vs CDI")
+    cp = cumulative_periods(port_m, cdi_m, months)
+    def _pdisp(v):
+        return v if isinstance(v, str) else f"{v:.0f}%"
+    crows = [{'Period': p, 'Portfolio': cp[p][0], 'CDI': cp[p][1], '% CDI': _pdisp(pct_cdi(cp[p][0], cp[p][1]))}
+             for p in ['MTD', '3M', '6M', 'YTD', '12M']]
+    st.dataframe(pd.DataFrame(crows).style.format({'Portfolio': '{:.2%}', 'CDI': '{:.2%}'}),
+                 use_container_width=True, hide_index=True)
+
+    with st.expander("🗂️ Allocation history", expanded=False):
+        for i, a in enumerate(_norm_alloc(allocs)):
+            rd = a['rebalance_date']
+            tag = f"effective until {rd.date()}" if rd is not None else "current allocation"
+            st.markdown(f"**Allocation {i+1}** — {tag}")
+            _wdf = pd.DataFrame({label: list(a['weights'].keys()),
+                                 'Weight %': [round(float(v), 2) for v in a['weights'].values()]})
+            st.dataframe(_wdf.style.format({'Weight %': '{:.2f}%'}), use_container_width=True, hide_index=True)
+
+    with st.expander("🧩 Book & asset attribution (weighted monthly contribution)", expanded=False):
+        st.caption("Uses the allocation active at each month-end. Books sum to the PORTFOLIO row.")
+        lvl = st.radio("Group by:", ["Category", "Sub-category", label], horizontal=True, key=f"reb_attr_{state_key}")
+        if lvl == "Category":
+            _gof = lambda a: ctx['group_map_fn'](a)[0]
+        elif lvl == "Sub-category":
+            _gof = lambda a: ctx['group_map_fn'](a)[1]
+        else:
+            _gof = lambda a: a
+        contrib, port_attr = rebalanced_group_contributions(allocs, ctx['asset_ret_fn'], cache, _gof, months)
+        arows = []
+        for g, series in sorted(contrib.items(), key=lambda kv: -sum(kv[1])):
+            arows.append({lvl: g, **{labels[i]: series[i] for i in range(len(months))},
+                          'Total': float(np.prod([1 + x for x in series]) - 1)})
+        arows.append({lvl: 'PORTFOLIO', **{labels[i]: port_attr[i] for i in range(len(months))},
+                      'Total': float(np.prod([1 + x for x in port_attr]) - 1)})
+        st.dataframe(pd.DataFrame(arows).style.format({c: '{:.2%}' for c in (labels + ['Total'])}),
+                     use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    if st.button("📤 Build rebalanced report (.xlsx)", key=f"reb_export_{state_key}"):
+        st.session_state[f'{state_key}_xlsx'] = build_rebalanced_xlsx(active['name'], allocs, months, labels, port_m, cdi_m, cp)
+    if st.session_state.get(f'{state_key}_xlsx'):
+        st.download_button("⬇️ Download rebalanced report (.xlsx)", data=st.session_state[f'{state_key}_xlsx'],
+                           file_name=f"rebalanced_{system}_{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx",
+                           mime=XLSX_MIME, key=f"reb_exp_dl_{state_key}")
 
 
 def calculate_portfolio_returns(fund_returns_dict, allocations):
@@ -5581,7 +6009,30 @@ def run_etf_system():
         if 'etf_temp_portfolio' not in st.session_state:
             st.session_state['etf_temp_portfolio'] = {}
         
-        etf_rec_tab1, etf_rec_tab2, etf_rec_tab3 = st.tabs(["📊 Portfolio Analysis", "📈 ETF Analysis", "📚 Book Analysis"])
+        etf_rec_tab1, etf_rec_tab4, etf_rec_tab2, etf_rec_tab3 = st.tabs(["📊 Portfolio Analysis", "🔁 Rebalanced Portfolio", "📈 ETF Analysis", "📚 Book Analysis"])
+        with etf_rec_tab4:
+            def _etf_reb_ret(a):
+                try:
+                    if a in prices_df.columns:
+                        _s = prices_df[a].dropna().pct_change().dropna()
+                        return _s if len(_s) > 0 else None
+                except Exception:
+                    return None
+                return None
+            def _etf_reb_grp(a):
+                if a in metrics_df.index:
+                    return (metrics_df.loc[a].get('Class', 'Unknown'), metrics_df.loc[a].get('Category', 'Unknown'))
+                return ('Unknown', 'Unknown')
+            _etf_user = st.session_state.get('username', 'default')
+            render_rebalanced_portfolio_tab({
+                'system': 'etf', 'asset_label': 'ETF',
+                'universe': list(metrics_df.index),
+                'asset_ret_fn': _etf_reb_ret, 'group_map_fn': _etf_reb_grp,
+                'cdi_daily': bench_returns_map.get('CDI'),
+                'user': _etf_user,
+                'can_manage': can_user_manage_portfolios(_etf_user),
+                'state_key': 'etf_rebalanced',
+            })
         
         # ═══════════════════════════════════════════════════════════════════════════
         # SECONDARY TAB 1: PORTFOLIO ANALYSIS
@@ -10889,7 +11340,28 @@ def main():
             if 'temp_portfolio' not in st.session_state:
                 st.session_state['temp_portfolio'] = {}
             
-            rec_tab1, rec_tab2, rec_tab3, rec_tab4 = st.tabs(["📊 Portfolio Analysis", "📈 Investment Fund Analysis", "📚 Book Analysis", "🏦 Consolidated"])
+            rec_tab1, rec_tab5, rec_tab2, rec_tab3, rec_tab4 = st.tabs(["📊 Portfolio Analysis", "🔁 Rebalanced Portfolio", "📈 Investment Fund Analysis", "📚 Book Analysis", "🏦 Consolidated"])
+            with rec_tab5:
+                def _fund_reb_ret(a):
+                    try:
+                        return get_fund_returns_by_name(a, fund_metrics, fund_details)
+                    except Exception:
+                        return None
+                def _fund_reb_grp(a):
+                    _r = fund_metrics[fund_metrics['FUNDO DE INVESTIMENTO'] == a]
+                    _c = _r['CATEGORIA BTG'].iloc[0] if (len(_r) > 0 and 'CATEGORIA BTG' in _r.columns) else 'Unknown'
+                    _s = _r['SUBCATEGORIA BTG'].iloc[0] if (len(_r) > 0 and 'SUBCATEGORIA BTG' in _r.columns) else 'Unknown'
+                    return (_c, _s)
+                _fund_user = st.session_state.get('username', 'default')
+                render_rebalanced_portfolio_tab({
+                    'system': 'fund', 'asset_label': 'Fund',
+                    'universe': fund_metrics['FUNDO DE INVESTIMENTO'].tolist(),
+                    'asset_ret_fn': _fund_reb_ret, 'group_map_fn': _fund_reb_grp,
+                    'cdi_daily': (benchmarks['CDI'] if (benchmarks is not None and 'CDI' in benchmarks.columns) else None),
+                    'user': _fund_user,
+                    'can_manage': can_user_manage_portfolios(_fund_user),
+                    'state_key': 'fund_rebalanced',
+                })
             
             # ═══════════════════════════════════════════════════════════════════════════
             # SECONDARY TAB 1: PORTFOLIO ANALYSIS
