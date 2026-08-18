@@ -2502,7 +2502,7 @@ def _seg_weighted_returns(weights, asset_ret_fn, cache, lo, hi, include_lo):
     cols = {}
     for a, w in weights.items():
         if a not in cache:
-            cache[a] = asset_ret_fn(a)
+            cache[a] = _safe_ret(asset_ret_fn, a)
         r = cache[a]
         if r is None or len(r) == 0:
             continue
@@ -2527,7 +2527,7 @@ def rebalanced_daily_returns(allocations, asset_ret_fn):
     firsts = []
     for a in allocations[0]['weights']:
         if a not in cache:
-            cache[a] = asset_ret_fn(a)
+            cache[a] = _safe_ret(asset_ret_fn, a)
         r = cache[a]
         if r is not None and len(r) > 0:
             firsts.append(r.index.min())
@@ -2539,7 +2539,7 @@ def rebalanced_daily_returns(allocations, asset_ret_fn):
     for a_i, alloc in enumerate(allocations):
         for a in alloc['weights']:
             if a not in cache:
-                cache[a] = asset_ret_fn(a)
+                cache[a] = _safe_ret(asset_ret_fn, a)
             r = cache[a]
             if r is not None and len(r) > 0:
                 last = r.index.max() if last is None else max(last, r.index.max())
@@ -2586,7 +2586,7 @@ def rebalanced_group_contributions(allocations, asset_ret_fn, cache, group_of, m
         ms = me.replace(day=1)
         for a, wa in w.items():
             if a not in cache:
-                cache[a] = asset_ret_fn(a)
+                cache[a] = _safe_ret(asset_ret_fn, a)
             r = cache[a]
             if r is None or len(r) == 0:
                 continue
@@ -2647,6 +2647,31 @@ def build_rebalanced_xlsx(name, allocations, months, labels, port_m, cdi_m, cp):
     buf.seek(0)
     return buf.getvalue()
 
+def _safe_ret(fn, a):
+    try:
+        return fn(a)
+    except Exception:
+        return None
+
+def rebalanced_active_series(system, asset_ret_fn):
+    reb = st.session_state.get('rebalanced_active')
+    if not reb or reb.get('system') != system:
+        return None, None
+    daily, rpts, _s, _c = rebalanced_daily_returns(reb['allocations'], asset_ret_fn)
+    return daily, rpts
+
+def add_rebalance_vlines(fig, reb_points, lo=None, hi=None):
+    if not reb_points:
+        return fig
+    for rp in reb_points:
+        try:
+            if (lo is None or rp >= lo) and (hi is None or rp <= hi):
+                fig.add_vline(x=rp, line=dict(color='#FF5252', width=1, dash='dot'))
+        except Exception:
+            pass
+    return fig
+
+
 def render_rebalanced_portfolio_tab(ctx):
     label = ctx['asset_label']
     state_key = ctx['state_key']
@@ -2655,6 +2680,19 @@ def render_rebalanced_portfolio_tab(ctx):
     system = ctx['system']
     cdi_daily = ctx.get('cdi_daily')
     XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    def _activate_for_analysis(_pn, _al):
+        st.session_state['rebalanced_active'] = {'system': system, 'allocations': _al, 'name': _pn}
+        try:
+            _cur = active_alloc_weights(_al, pd.Timestamp.now())
+            if ctx.get('holdings_key'):
+                st.session_state[ctx['holdings_key']] = {k: float(v) for k, v in _cur.items()}
+            if ctx.get('saved_key'):
+                st.session_state[ctx['saved_key']] = True
+            if ctx.get('name_key'):
+                st.session_state[ctx['name_key']] = _pn
+        except Exception:
+            pass
 
     st.markdown("### 🔁 Rebalanced Portfolio")
     st.markdown("Build a portfolio whose allocation changes over time, via an Excel template. "
@@ -2698,6 +2736,7 @@ def render_rebalanced_portfolio_tab(ctx):
                         with col1:
                             if st.button("👁️ Load into view", key=f"reb_view_{state_key}", use_container_width=True):
                                 st.session_state[state_key] = {'name': (_nm or 'Rebalanced Portfolio'), 'allocations': allocs}
+                                _activate_for_analysis((_nm or 'Rebalanced Portfolio'), allocs)
                                 st.rerun()
                         with col2:
                             if st.button("💾 Save to Supabase", key=f"reb_save_{state_key}", use_container_width=True):
@@ -2705,6 +2744,7 @@ def render_rebalanced_portfolio_tab(ctx):
                                     st.warning("Enter a portfolio name first.")
                                 elif save_rebalanced_to_supabase(_nm, allocs, user, system):
                                     st.session_state[state_key] = {'name': _nm, 'allocations': allocs}
+                                    _activate_for_analysis(_nm, allocs)
                                     st.success(f"Saved '{_nm}'.")
                                     st.rerun()
                     else:
@@ -2724,6 +2764,7 @@ def render_rebalanced_portfolio_tab(ctx):
                     a = load_rebalanced_from_supabase(_sel, user, system)
                     if a:
                         st.session_state[state_key] = {'name': _sel, 'allocations': a}
+                        _activate_for_analysis(_sel, a)
                         st.rerun()
                     else:
                         st.error("Could not load this portfolio.")
@@ -6032,6 +6073,9 @@ def run_etf_system():
                 'user': _etf_user,
                 'can_manage': can_user_manage_portfolios(_etf_user),
                 'state_key': 'etf_rebalanced',
+                'holdings_key': 'etf_recommended_portfolio',
+                'saved_key': 'etf_recommended_portfolio_saved',
+                'name_key': None,
             })
         
         # ═══════════════════════════════════════════════════════════════════════════
@@ -6085,6 +6129,7 @@ def run_etf_system():
                                 st.success(f"✅ {len(valid)} valid ETFs")
                                 if st.button("💾 Save Portfolio", key="etf_save_up"):
                                     st.session_state['etf_recommended_portfolio'] = valid
+                                    st.session_state['rebalanced_active'] = None
                                     st.session_state['etf_recommended_portfolio_saved'] = True
                                     st.rerun()
                     except Exception as e:
@@ -6118,6 +6163,7 @@ def run_etf_system():
                     st.metric("Total", f"{sum(st.session_state['etf_temp_portfolio'].values()):.1f}%")
                     if st.button("💾 Save Portfolio", key="etf_save_sel"):
                         st.session_state['etf_recommended_portfolio'] = st.session_state['etf_temp_portfolio'].copy()
+                        st.session_state['rebalanced_active'] = None
                         st.session_state['etf_recommended_portfolio_saved'] = True
                         st.rerun()
             
@@ -6219,6 +6265,7 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                                 loaded = load_etf_portfolio_from_supabase(selected_portfolio, current_user)
                                 if loaded:
                                     st.session_state['etf_recommended_portfolio'] = loaded
+                                    st.session_state['rebalanced_active'] = None
                                     st.session_state['etf_recommended_portfolio_saved'] = True
                                     st.session_state['etf_temp_portfolio'] = loaded.copy()
                                     st.success(f"✅ Portfolio '{selected_portfolio}' loaded!")
@@ -6264,6 +6311,12 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                     _row_w = _eff.sum(axis=1)
                     portfolio_returns = (ret_df.fillna(0) * _eff).sum(axis=1) / _row_w.replace(0, np.nan)
                     portfolio_returns = portfolio_returns.dropna()
+                _rd_epa, _rpts_epa = rebalanced_active_series('etf', lambda a: (prices_df[a].dropna().pct_change().dropna() if a in prices_df.columns else None))
+                if _rd_epa is not None:
+                    portfolio_returns = _rd_epa
+                    st.session_state['_etf_pa_reb_points'] = _rpts_epa
+                else:
+                    st.session_state['_etf_pa_reb_points'] = None
                 
                 if portfolio_returns is not None and len(portfolio_returns) > 0:
                     # Period selection
@@ -6475,6 +6528,7 @@ CREATE POLICY "Allow all operations" ON etf_recommended_portfolios
                         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                     )
                     
+                    add_rebalance_vlines(fig_returns, st.session_state.get('_etf_pa_reb_points'), port_ret_filtered.index.min(), port_ret_filtered.index.max())
                     st.plotly_chart(fig_returns, use_container_width=True)
                     
                     # ═══════════════════════════════════════════════════════════════════
@@ -11361,6 +11415,9 @@ def main():
                     'user': _fund_user,
                     'can_manage': can_user_manage_portfolios(_fund_user),
                     'state_key': 'fund_rebalanced',
+                    'holdings_key': 'recommended_portfolio',
+                    'saved_key': 'recommended_portfolio_saved',
+                    'name_key': 'recommended_portfolio_name',
                 })
             
             # ═══════════════════════════════════════════════════════════════════════════
@@ -11425,6 +11482,7 @@ def main():
                                         )
                                         if st.button("➕ Add / Save Portfolio", key="save_up", use_container_width=True):
                                             st.session_state['recommended_portfolio'] = valid
+                                            st.session_state['rebalanced_active'] = None
                                             st.session_state['recommended_portfolio_saved'] = True
                                             st.session_state['temp_portfolio'] = dict(valid)
                                             st.rerun()
@@ -11461,6 +11519,7 @@ def main():
                             st.metric("Total", f"{sum(st.session_state['temp_portfolio'].values()):.1f}%")
                             if st.button("💾 Save Portfolio", key="save_sel"):
                                 st.session_state['recommended_portfolio'] = st.session_state['temp_portfolio'].copy()
+                                st.session_state['rebalanced_active'] = None
                                 st.session_state['recommended_portfolio_saved'] = True
                                 st.rerun()
                 
@@ -11548,6 +11607,7 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
                                         loaded = load_portfolio_from_supabase(selected_portfolio, current_user)
                                         if loaded:
                                             st.session_state['recommended_portfolio'] = loaded
+                                            st.session_state['rebalanced_active'] = None
                                             st.session_state['recommended_portfolio_name'] = selected_portfolio
                                             st.session_state['recommended_portfolio_saved'] = True
                                             st.session_state['temp_portfolio'] = loaded.copy()
@@ -11575,6 +11635,7 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
                                     loaded = load_portfolio_from_supabase(selected_portfolio, current_user)
                                     if loaded:
                                         st.session_state['recommended_portfolio'] = loaded
+                                        st.session_state['rebalanced_active'] = None
                                         st.session_state['recommended_portfolio_name'] = selected_portfolio
                                         st.session_state['recommended_portfolio_saved'] = True
                                         st.session_state['temp_portfolio'] = loaded.copy()
@@ -11625,7 +11686,8 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
                         _pname = st.session_state.get('recommended_portfolio_name', 'Recommended Portfolio')
                         _frd = {fn: get_fund_returns_by_name(fn, fund_metrics, fund_details) for fn in portfolio.keys()}
                         _frd = {k: v for k, v in _frd.items() if v is not None}
-                        _pret = calculate_portfolio_returns(_frd, portfolio) if _frd else None
+                        _rd_mr, _ = rebalanced_active_series('fund', lambda a: get_fund_returns_by_name(a, fund_metrics, fund_details))
+                        _pret = _rd_mr if _rd_mr is not None else (calculate_portfolio_returns(_frd, portfolio) if _frd else None)
                         _cdi = benchmarks['CDI'] if 'CDI' in benchmarks.columns else None
                         _pp = calendar_period_returns(_pret) if _pret is not None else None
                         _cp = calendar_period_returns(_cdi) if _cdi is not None else None
@@ -11742,7 +11804,13 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
                     fund_returns_dict = {k: v for k, v in fund_returns_dict.items() if v is not None}
                     
                     if fund_returns_dict:
-                        portfolio_returns = calculate_portfolio_returns(fund_returns_dict, portfolio)
+                        _rd_pa, _rpts_pa = rebalanced_active_series('fund', lambda a: get_fund_returns_by_name(a, fund_metrics, fund_details))
+                        if _rd_pa is not None:
+                            portfolio_returns = _rd_pa
+                            st.session_state['_pa_reb_points'] = _rpts_pa
+                        else:
+                            portfolio_returns = calculate_portfolio_returns(fund_returns_dict, portfolio)
+                            st.session_state['_pa_reb_points'] = None
                         
                         if portfolio_returns is not None and len(portfolio_returns) > 0:
                             st.markdown("---")
@@ -11780,6 +11848,7 @@ CREATE POLICY "Allow all operations" ON recommended_portfolios
                             
                             # Cumulative returns chart
                             fig_returns = create_returns_chart(port_ret_filtered, benchmark_dict, "Recommended Portfolio", selected_period)
+                            add_rebalance_vlines(fig_returns, st.session_state.get('_pa_reb_points'), port_ret_filtered.index.min(), port_ret_filtered.index.max())
                             st.plotly_chart(fig_returns, use_container_width=True)
                             
                             # ═══════════════════════════════════════════════════════════════════
